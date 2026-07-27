@@ -1,0 +1,405 @@
+local servicesFolder = script.Parent.Services
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local CollectionService = game:GetService("CollectionService")
+local Players = game:GetService("Players")
+
+local StartTime = os.clock()
+
+local cachedModules = {}
+
+for _, moduleScript: ModuleScript in servicesFolder:GetChildren() do
+	if moduleScript:IsA("ModuleScript") then
+		local ok, result = pcall(require, moduleScript)
+		if ok then
+			cachedModules[moduleScript.Name] = result
+		else
+			warn("[Server] Failed to require service '" .. moduleScript.Name .. "': " .. tostring(result))
+		end
+	end
+end
+
+local requiredModule = require(script.CachedModules) 
+requiredModule.Cache = cachedModules
+
+
+for moduleName, moduleScript in cachedModules do
+	moduleScript.cachedModules = cachedModules
+end
+
+for moduleName, moduleScript in cachedModules do
+	if typeof(moduleScript.init) == "function" then
+		local ok, err = pcall(moduleScript.init)
+		if not ok then
+			warn("[Server] Failed to init service '" .. moduleName .. "': " .. tostring(err))
+		end
+	end
+end
+
+local function getOwnedPlot(player: Player): Model?
+	for _, plot in ipairs(workspace.Plots:GetChildren()) do
+		if plot:IsA("Model") and plot:GetAttribute("USERID") == player.UserId then
+			return plot
+		end
+	end
+	return nil
+end
+
+ReplicatedStorage.RemoteEvents.Teleport.OnServerEvent:Connect(function(plr, destinationKey)
+	if not cachedModules.RateLimiter or not cachedModules.RateLimiter.guard(plr, "Teleport", 6, 5) then return end
+	if typeof(destinationKey) ~= "string" then return end
+
+	local character = plr.Character
+	local hrp = character and character:FindFirstChild("HumanoidRootPart")
+	if not hrp then return end
+
+	local targetPart: BasePart? = nil
+
+	if destinationKey == "Shop" then
+		local shop = workspace:FindFirstChild("Shop")
+		targetPart = shop and shop:FindFirstChild("SpawnLocation") :: BasePart?
+	elseif destinationKey == "Home" then
+		local plot = getOwnedPlot(plr)
+		targetPart = plot and plot:FindFirstChild("SpawnLocation") :: BasePart?
+	end
+
+	if not targetPart or not targetPart:IsA("BasePart") then return end
+
+	hrp.CFrame = targetPart.CFrame + Vector3.new(0, 3, 0)
+end)
+
+-- ===== BUILD OBJECT HANDLERS (Place, PlaceArea, DeleteObject, RestoreObject,
+-- MoveObject, StoreObject, ToggleCollisions, RequestInventory) =====
+
+local buildIdCounter = 1
+local trashStore: {[number]: {Name: string, CF: CFrame, Attributes: {[string]: any}}} = {}
+local collisionDisabled: {[Player]: boolean} = {}
+
+local function findBuildAsset(objectName: string): Instance?
+	local buildMode = ReplicatedStorage:FindFirstChild("BuildMode")
+	local assets = buildMode and buildMode:FindFirstChild("Assets")
+	if not assets then return nil end
+	for _, folder in assets:GetChildren() do
+		if folder:IsA("Folder") then
+			local object = folder:FindFirstChild(objectName)
+			if object then return object end
+		end
+	end
+	return nil
+end
+
+local function isWithinPlotBounds(plot: Model, position: Vector3, marginStuds: number?): boolean
+	local base = plot:FindFirstChild("Base")
+	if not base or not base:IsA("BasePart") then return false end
+	-- Use the Base part's actual physical size as the buildable footprint,
+	-- matching BuildServer.isWithinPlotBounds. PlotSize attribute is optional
+	-- metadata that may not exist on live plots.
+	local margin = marginStuds or 0
+	local halfExtents = Vector3.new(base.Size.X / 2 + margin, base.Size.Y / 2 + 1000, base.Size.Z / 2 + margin)
+	local localPos = base.CFrame:PointToObjectSpace(position)
+	return math.abs(localPos.X) <= halfExtents.X
+		and math.abs(localPos.Y) <= halfExtents.Y
+		and math.abs(localPos.Z) <= halfExtents.Z
+end
+
+local function getActingPlot(player: Player): Model?
+	local plotService = cachedModules.PlotService
+	if plotService then
+		return plotService.getActingPlot(player, true)
+	end
+	return nil
+end
+
+local function getBuildObjectsFolder(plot: Model): Folder
+	local buildObjects = plot:FindFirstChild("BuildObjects")
+	if not buildObjects then
+		buildObjects = Instance.new("Folder")
+		buildObjects.Name = "BuildObjects"
+		buildObjects.Parent = plot
+	end
+	return buildObjects :: Folder
+end
+
+local function findObjectByBuildId(plot: Model, buildId: number): Instance?
+	local buildObjects = plot:FindFirstChild("BuildObjects")
+	if not buildObjects then return nil end
+	for _, obj in buildObjects:GetChildren() do
+		if obj:GetAttribute("BuildId") == buildId then return obj end
+	end
+	return nil
+end
+
+local function savePlotState(player: Player)
+	local plotService = cachedModules.PlotService
+	if plotService and plotService.savePlotState then
+		plotService.savePlotState(player)
+	end
+end
+
+local function getBuildInventory(player: Player): {[string]: number}
+	local dataService = cachedModules.DataService
+	local playerData = dataService and dataService.getData(player)
+	if not playerData then return {} end
+	playerData.BuildInventory = playerData.BuildInventory or {}
+	return playerData.BuildInventory
+end
+
+local function sendInventoryUpdate(player: Player)
+	local inventory = getBuildInventory(player)
+	ReplicatedStorage.RemoteEvents.InventoryUpdate:FireClient(player, inventory)
+end
+
+local function applyFloorTags(obj: Instance)
+	local isFloor = obj:GetAttribute("IsFloor") == true
+		or string.find(string.lower(obj.Name), "floor") ~= nil
+	if isFloor then
+		if obj:IsA("BasePart") then
+			CollectionService:AddTag(obj, "Object_IgnoreCollision")
+		elseif obj:IsA("Model") then
+			for _, part in obj:GetDescendants() do
+				if part:IsA("BasePart") then
+					CollectionService:AddTag(part, "Object_IgnoreCollision")
+				end
+			end
+		end
+	end
+end
+
+-- Place (single object from build menu or inventory)
+ReplicatedStorage.RemoteEvents.Place.OnServerEvent:Connect(function(player: Player, data: any)
+	local rateLimiter = cachedModules.RateLimiter
+	if rateLimiter and not rateLimiter.guard(player, "Place", 10, 3) then return end
+
+	local objectName = data.ObjectName
+	local cf = data.CF
+	if typeof(objectName) ~= "string" or typeof(cf) ~= "CFrame" then return end
+
+	local plot = getActingPlot(player)
+	if not plot then return end
+	if not isWithinPlotBounds(plot, cf.Position) then return end
+
+	local asset = findBuildAsset(objectName)
+	if not asset then return end
+
+	if data.FromInventory then
+		local inventory = getBuildInventory(player)
+		local count = inventory[objectName] or 0
+		if count <= 0 then return end
+		inventory[objectName] = count - 1
+	end
+
+	local newObject = asset:Clone()
+	newObject:PivotTo(cf)
+	local buildId = buildIdCounter
+	buildIdCounter += 1
+	newObject:SetAttribute("BuildId", buildId)
+
+	applyFloorTags(newObject)
+	newObject.Parent = getBuildObjectsFolder(plot)
+
+	savePlotState(player)
+
+	ReplicatedStorage.RemoteEvents.PlacementResult:FireClient(player, {
+		ObjectName = objectName,
+		CF = cf,
+		ObjectId = buildId,
+	})
+
+	if data.FromInventory then
+		sendInventoryUpdate(player)
+	end
+end)
+
+-- PlaceArea (multiple floor tiles from drag)
+ReplicatedStorage.RemoteEvents.PlaceArea.OnServerEvent:Connect(function(player: Player, data: any)
+	local rateLimiter = cachedModules.RateLimiter
+	if rateLimiter and not rateLimiter.guard(player, "PlaceArea", 5, 2) then return end
+
+	local objectName = data.ObjectName
+	local cframes = data.CFrames
+	if typeof(objectName) ~= "string" or typeof(cframes) ~= "table" then return end
+	if #cframes > 200 then return end
+
+	local plot = getActingPlot(player)
+	if not plot then return end
+
+	local asset = findBuildAsset(objectName)
+	if not asset then return end
+
+	local buildObjects = getBuildObjectsFolder(plot)
+
+	for _, cf in cframes do
+		if typeof(cf) == "CFrame" and isWithinPlotBounds(plot, cf.Position) then
+			local newObject = asset:Clone()
+			newObject:PivotTo(cf)
+			local buildId = buildIdCounter
+			buildIdCounter += 1
+			newObject:SetAttribute("BuildId", buildId)
+			applyFloorTags(newObject)
+			newObject.Parent = buildObjects
+		end
+	end
+
+	savePlotState(player)
+end)
+
+-- DeleteObject (by BuildId)
+ReplicatedStorage.RemoteEvents.DeleteObject.OnServerEvent:Connect(function(player: Player, data: any)
+	local rateLimiter = cachedModules.RateLimiter
+	if rateLimiter and not rateLimiter.guard(player, "DeleteObject", 10, 3) then return end
+
+	local objectId = data.ObjectId
+	if typeof(objectId) ~= "number" then return end
+
+	local plot = getActingPlot(player)
+	if not plot then return end
+
+	local obj = findObjectByBuildId(plot, objectId)
+	if not obj then return end
+
+	-- If the object is a wall build (has BuildType attribute), route to
+	-- WallBuildService's delete logic instead of the furniture delete path.
+	local buildType = obj:GetAttribute("BuildType")
+	if buildType then
+		local wallBuildService = cachedModules.WallBuildService
+		if wallBuildService then
+			local part = obj:IsA("BasePart") and obj or obj:FindFirstChildWhichIsA("BasePart")
+			if part then
+				wallBuildService.deleteBuildViaPart(player, part)
+				savePlotState(player)
+				return
+			end
+		end
+	end
+
+	trashStore[objectId] = {
+		Name = obj.Name,
+		CF = obj:GetPivot(),
+		Attributes = {},
+	}
+	for _, attrName in {"IsFloor", "Category", "SprayEffect", "CurrentStock", "StockAmount", "MaxSlots"} do
+		local val = obj:GetAttribute(attrName)
+		if val ~= nil then
+			trashStore[objectId].Attributes[attrName] = val
+		end
+	end
+
+	obj.Parent = nil
+	savePlotState(player)
+end)
+
+-- RestoreObject (undo delete)
+ReplicatedStorage.RemoteEvents.RestoreObject.OnServerEvent:Connect(function(player: Player, data: any)
+	local rateLimiter = cachedModules.RateLimiter
+	if rateLimiter and not rateLimiter.guard(player, "RestoreObject", 10, 3) then return end
+
+	local objectId = data.ObjectId
+	if typeof(objectId) ~= "number" then return end
+
+	local trashEntry = trashStore[objectId]
+	if not trashEntry then return end
+
+	local plot = getActingPlot(player)
+	if not plot then return end
+	if not isWithinPlotBounds(plot, trashEntry.CF.Position) then return end
+
+	local asset = findBuildAsset(trashEntry.Name)
+	if not asset then return end
+
+	local newObject = asset:Clone()
+	newObject:PivotTo(trashEntry.CF)
+	newObject:SetAttribute("BuildId", objectId)
+
+	for attrName, val in pairs(trashEntry.Attributes) do
+		newObject:SetAttribute(attrName, val)
+	end
+
+	applyFloorTags(newObject)
+	newObject.Parent = getBuildObjectsFolder(plot)
+	trashStore[objectId] = nil
+	savePlotState(player)
+end)
+
+-- MoveObject (reposition by BuildId)
+ReplicatedStorage.RemoteEvents.MoveObject.OnServerEvent:Connect(function(player: Player, data: any)
+	local rateLimiter = cachedModules.RateLimiter
+	if rateLimiter and not rateLimiter.guard(player, "MoveObject", 10, 3) then return end
+
+	local objectId = data.ObjectId
+	local cf = data.CF
+	if typeof(objectId) ~= "number" or typeof(cf) ~= "CFrame" then return end
+
+	local plot = getActingPlot(player)
+	if not plot then return end
+	if not isWithinPlotBounds(plot, cf.Position) then return end
+
+	local obj = findObjectByBuildId(plot, objectId)
+	if not obj then return end
+
+	obj:PivotTo(cf)
+	savePlotState(player)
+end)
+
+-- StoreObject (move to inventory)
+ReplicatedStorage.RemoteEvents.StoreObject.OnServerEvent:Connect(function(player: Player, data: any)
+	local rateLimiter = cachedModules.RateLimiter
+	if rateLimiter and not rateLimiter.guard(player, "StoreObject", 10, 3) then return end
+
+	local objectId = data.ObjectId
+	if typeof(objectId) ~= "number" then return end
+
+	local plot = getActingPlot(player)
+	if not plot then return end
+
+	local obj = findObjectByBuildId(plot, objectId)
+	if not obj then return end
+
+	-- Structural items (walls, floors, roofs, doors, windows) cannot be
+	-- stored into inventory — only furniture can.
+	if obj:GetAttribute("BuildType") then return end
+
+	local inventory = getBuildInventory(player)
+	inventory[obj.Name] = (inventory[obj.Name] or 0) + 1
+
+	obj.Parent = nil
+	savePlotState(player)
+	sendInventoryUpdate(player)
+end)
+
+-- ToggleCollisions (toggle build object collision on/off)
+ReplicatedStorage.RemoteEvents.ToggleCollisions.OnServerEvent:Connect(function(player: Player)
+	local rateLimiter = cachedModules.RateLimiter
+	if rateLimiter and not rateLimiter.guard(player, "ToggleCollisions", 5, 2) then return end
+
+	local plot = getActingPlot(player)
+	if not plot then return end
+
+	collisionDisabled[player] = not collisionDisabled[player]
+	local disabled = collisionDisabled[player]
+
+	local buildObjects = plot:FindFirstChild("BuildObjects")
+	if buildObjects then
+		for _, obj in buildObjects:GetChildren() do
+			if obj:IsA("BasePart") then
+				obj.CanCollide = not disabled
+			elseif obj:IsA("Model") then
+				for _, part in obj:GetDescendants() do
+					if part:IsA("BasePart") then
+						part.CanCollide = not disabled
+					end
+				end
+			end
+		end
+	end
+
+	ReplicatedStorage.RemoteEvents.ToggleCollisions:FireClient(player, disabled)
+end)
+
+-- RequestInventory (send build inventory to client)
+ReplicatedStorage.RemoteEvents.RequestInventory.OnServerEvent:Connect(function(player: Player)
+	sendInventoryUpdate(player)
+end)
+
+-- Cleanup on player leave
+Players.PlayerRemoving:Connect(function(player: Player)
+	collisionDisabled[player] = nil
+end)
