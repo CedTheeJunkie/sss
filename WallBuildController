@@ -1,0 +1,271 @@
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local UserInputService = game:GetService("UserInputService")
+local RunService = game:GetService("RunService")
+
+local player = Players.LocalPlayer
+local playerGui = player:WaitForChild("PlayerGui")
+local buildGui = playerGui:WaitForChild("Build")
+local toolbar = buildGui:WaitForChild("Toolbar")
+
+local wallButton = toolbar:WaitForChild("Wall")
+local doorButton = toolbar:WaitForChild("Door")
+local windowButton = toolbar:WaitForChild("Window")
+local roofButton = toolbar:WaitForChild("Roof")
+
+local Modules = ReplicatedStorage:WaitForChild("Modules")
+local General = require(ReplicatedStorage.BuildMode.Utility:WaitForChild("General"))
+local Settings = require(ReplicatedStorage.BuildMode:WaitForChild("Settings"))
+local ActingPlotResolver = require(Modules:WaitForChild("ActingPlotResolver"))
+local WallBuildConfig = require(Modules:WaitForChild("WallBuildConfig"))
+
+local RemoteEvents = ReplicatedStorage:WaitForChild("RemoteEvents")
+local wallBuildEvent = RemoteEvents:WaitForChild("WallBuildAction")
+
+local currentTool: string? = nil -- "Wall" | "Door" | "Window" | "Roof"
+local wallStartPos: Vector3? = nil
+local rotation = 0
+local ghostPart: Part? = nil
+
+local toolButtons = { Wall = wallButton, Door = doorButton, Window = windowButton, Roof = roofButton }
+local originalColors = {}
+for name, btn in pairs(toolButtons) do
+	originalColors[name] = btn.ImageColor3
+end
+
+local function getPlot(): Model?
+	return ActingPlotResolver.getActingPlot(player, true)
+end
+
+local function snapToGrid(pos: Vector3): Vector3
+	local gridSize = Settings.GridUnit or 1
+	return Vector3.new(
+		math.round(pos.X / gridSize) * gridSize,
+		pos.Y,
+		math.round(pos.Z / gridSize) * gridSize
+	)
+end
+
+local function destroyGhost()
+	if ghostPart then
+		ghostPart:Destroy()
+		ghostPart = nil
+	end
+end
+
+local function showGhost(size: Vector3, cframe: CFrame, valid: boolean)
+	if not ghostPart then
+		ghostPart = Instance.new("Part")
+		ghostPart.Name = "WallGhostPreview"
+		ghostPart.Anchored = true
+		ghostPart.CanCollide = false
+		ghostPart.CanQuery = false
+		ghostPart.CanTouch = false
+		ghostPart.Material = Enum.Material.ForceField
+		ghostPart.Transparency = WallBuildConfig.GhostTransparency
+		ghostPart.Parent = workspace
+	end
+	ghostPart.Size = size
+	ghostPart.CFrame = cframe
+	ghostPart.Color = valid and WallBuildConfig.Colors.GhostValid or WallBuildConfig.Colors.GhostInvalid
+end
+
+local function setActiveTool(toolName: string?)
+	currentTool = toolName
+	wallStartPos = nil
+	destroyGhost()
+	for name, btn in pairs(toolButtons) do
+		btn.ImageColor3 = (name == toolName) and Color3.fromRGB(100, 200, 255) or originalColors[name]
+	end
+	player:SetAttribute("WallBuildTool", toolName)
+end
+
+for name, btn in pairs(toolButtons) do
+	btn.MouseButton1Click:Connect(function()
+		if currentTool == name then
+			setActiveTool(nil)
+		else
+			setActiveTool(name)
+		end
+	end)
+end
+
+-- Exit our tools if another build tool (delete, paint, etc.) takes over
+player:GetAttributeChangedSignal("DeleteMode"):Connect(function()
+	if player:GetAttribute("DeleteMode") and currentTool then
+		setActiveTool(nil)
+	end
+end)
+
+buildGui:GetPropertyChangedSignal("Enabled"):Connect(function()
+	if not buildGui.Enabled then
+		setActiveTool(nil)
+	end
+end)
+
+-- ===== GHOST PREVIEW =====
+
+local function getWallCFrame(pos1: Vector3, pos2: Vector3): (CFrame, Vector3)
+	pos2 = Vector3.new(pos2.X, pos1.Y, pos2.Z)
+	local direction = pos2 - pos1
+	local length = Vector3.new(direction.X, 0, direction.Z).Magnitude
+	local angle = math.atan2(direction.X, direction.Z)
+	local midpoint = (pos1 + pos2) / 2
+	midpoint = Vector3.new(midpoint.X, pos1.Y + WallBuildConfig.WallHeight / 2, midpoint.Z)
+	return CFrame.new(midpoint) * CFrame.Angles(0, angle, 0), Vector3.new(WallBuildConfig.WallThickness, WallBuildConfig.WallHeight, length)
+end
+
+local function getGroundRaycastParams(plot: Model): RaycastParams
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Include
+	local base = plot:FindFirstChild("Base")
+	local buildObjects = plot:FindFirstChild("BuildObjects")
+	local instances = {}
+	if base then table.insert(instances, base) end
+	if buildObjects then table.insert(instances, buildObjects) end
+	params.FilterDescendantsInstances = instances
+	return params
+end
+
+local function getWallOnlyRaycastParams(plot: Model): RaycastParams
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Include
+	local buildObjects = plot:FindFirstChild("BuildObjects")
+	params.FilterDescendantsInstances = buildObjects and { buildObjects } or {}
+	return params
+end
+
+local function updateGhost()
+	if not currentTool then
+		destroyGhost()
+		return
+	end
+
+	local plot = getPlot()
+	if not plot then
+		destroyGhost()
+		return
+	end
+
+	if currentTool == "Wall" then
+		local result = General.GetMouseResult(getGroundRaycastParams(plot))
+		if not result then destroyGhost() return end
+		local snapped = snapToGrid(result.Position)
+
+		if wallStartPos then
+			local cframe, size = getWallCFrame(wallStartPos, snapped)
+			if size.Z > 0.5 then
+				showGhost(size, cframe, true)
+			else
+				destroyGhost()
+			end
+		else
+			showGhost(Vector3.new(0.5, 0.5, 0.5), CFrame.new(snapped), true)
+		end
+
+	elseif currentTool == "Roof" then
+		local result = General.GetMouseResult(getGroundRaycastParams(plot))
+		if not result then destroyGhost() return end
+		local snapped = snapToGrid(result.Position)
+		local size = Vector3.new(WallBuildConfig.TileSize, WallBuildConfig.RoofThickness, WallBuildConfig.TileSize)
+		local cframe = CFrame.new(snapped) * CFrame.Angles(0, math.rad(rotation), 0)
+		showGhost(size, cframe, true)
+
+	elseif currentTool == "Door" or currentTool == "Window" then
+		local result = General.GetMouseResult(getWallOnlyRaycastParams(plot))
+		local wallPart = result and result.Instance
+		if wallPart and wallPart:GetAttribute("BuildType") == "Wall" then
+			local localClick = wallPart.CFrame:ToObjectSpace(CFrame.new(result.Position))
+			local localZ = localClick.Z
+			local height, width, yLocal, thickness
+			if currentTool == "Door" then
+				height, width = WallBuildConfig.DoorHeight, WallBuildConfig.DoorWidth
+				yLocal = -WallBuildConfig.WallHeight / 2 + height / 2
+				thickness = WallBuildConfig.DoorThickness
+			else
+				height, width = WallBuildConfig.WindowHeight, WallBuildConfig.WindowWidth
+				yLocal = -WallBuildConfig.WallHeight / 2 + WallBuildConfig.WindowSillHeight + height / 2
+				thickness = WallBuildConfig.WindowThickness
+			end
+			local size = Vector3.new(thickness, height, width)
+			local cframe = wallPart.CFrame * CFrame.new(0, yLocal, localZ)
+
+			local wallLength = wallPart.Size.Z
+			local halfWidth = width / 2
+			local fits = (localZ - halfWidth >= -wallLength / 2 + 0.1) and (localZ + halfWidth <= wallLength / 2 - 0.1)
+			showGhost(size, cframe, fits)
+		else
+			destroyGhost()
+		end
+	end
+end
+
+RunService.RenderStepped:Connect(updateGhost)
+
+-- ===== CLICK HANDLING =====
+
+local function onClick()
+	if not currentTool then return end
+	local plot = getPlot()
+	if not plot then return end
+
+	if currentTool == "Wall" then
+		local result = General.GetMouseResult(getGroundRaycastParams(plot))
+		if not result then return end
+		local snapped = snapToGrid(result.Position)
+
+		if not wallStartPos then
+			wallStartPos = snapped
+		else
+			local _, size = getWallCFrame(wallStartPos, snapped)
+			if size.Z > 0.5 then
+				wallBuildEvent:FireServer("PlaceWall", { startPos = wallStartPos, endPos = snapped })
+			end
+			wallStartPos = nil
+		end
+
+	elseif currentTool == "Roof" then
+		local result = General.GetMouseResult(getGroundRaycastParams(plot))
+		if not result then return end
+		local snapped = snapToGrid(result.Position)
+		wallBuildEvent:FireServer("PlaceRoof", {
+			pos = snapped,
+			size = Vector3.new(WallBuildConfig.TileSize, WallBuildConfig.RoofThickness, WallBuildConfig.TileSize),
+			rotation = rotation,
+		})
+
+	elseif currentTool == "Door" or currentTool == "Window" then
+		local result = General.GetMouseResult(getWallOnlyRaycastParams(plot))
+		local wallPart = result and result.Instance
+		if wallPart and wallPart:GetAttribute("BuildType") == "Wall" then
+			local width = currentTool == "Door" and WallBuildConfig.DoorWidth or WallBuildConfig.WindowWidth
+			local localZ = wallPart.CFrame:ToObjectSpace(CFrame.new(result.Position)).Z
+			local wallLength = wallPart.Size.Z
+			local halfWidth = width / 2
+			if (localZ - halfWidth >= -wallLength / 2 + 0.1) and (localZ + halfWidth <= wallLength / 2 - 0.1) then
+				if currentTool == "Door" then
+					-- Hold Shift to place a double door instead of a single
+					local isDouble = UserInputService:IsKeyDown(Enum.KeyCode.LeftShift) or UserInputService:IsKeyDown(Enum.KeyCode.RightShift)
+					wallBuildEvent:FireServer("PlaceDoor", { wallPart = wallPart, position = result.Position, isDouble = isDouble })
+				else
+					wallBuildEvent:FireServer("PlaceWindow", { wallPart = wallPart, position = result.Position })
+				end
+			end
+		end
+	end
+end
+
+UserInputService.InputBegan:Connect(function(input, gameProcessed)
+	if gameProcessed or not currentTool then return end
+
+	if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+		onClick()
+	elseif input.UserInputType == Enum.UserInputType.MouseButton2 then
+		-- Right-click cancels an in-progress wall start point
+		if currentTool == "Wall" and wallStartPos then
+			wallStartPos = nil
+		end
+	elseif input.KeyCode == Enum.KeyCode.R then
+		rotation = (rotation + 90) % 360
+	end
+end)
