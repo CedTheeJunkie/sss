@@ -11,8 +11,6 @@ local wallBuildEvent = remotes:WaitForChild("WallBuildAction")
 
 local Service = {}
 
--- BuildId counter for wall-build objects (offset to avoid collision with
--- Server.lua's furniture BuildId counter which starts at 1)
 local wallBuildIdCounter = 100000
 
 local function nextBuildId(): number
@@ -20,13 +18,9 @@ local function nextBuildId(): number
 	return wallBuildIdCounter
 end
 
--- doorRegistry[doorLeafPart] = { hingeSide = 1 or -1, isOpen = false, tween = nil }
 local doorRegistry: {[BasePart]: any} = {}
 
--- === Plot / permission helpers (mirrors PlotService.getActingPlot, but this
--- === service doesn't need the client-side fast path, just the server check) ===
-
-local ACTING_PLOT_RANGE = 60
+-- === Plot / permission helpers ===
 
 local function isWithinPlotBounds(plot: Model, position: Vector3, marginStuds: number?): boolean
 	local base = plot:FindFirstChild("Base")
@@ -57,10 +51,6 @@ local function getBuildObjects(plot: Model): Folder
 	end
 	return buildObjects
 end
-
--- === Persistence (procedural pieces can't be re-cloned from a named asset
--- === like furniture, so they're saved as replay records and reconstructed
--- === by re-running the same placement functions on restore) ===
 
 local function recordBuild(player: Player, record: {[string]: any}): number?
 	local dataService = cachedModules.Cache.DataService
@@ -108,8 +98,26 @@ local function getWallInfo(model: Model): (CFrame, Vector3)
 	return CFrame.fromMatrix(pos, right, up), size
 end
 
--- === Door swing registration (both single and double doors register one
--- === entry per leaf, so a double door is just two leaves swinging opposite ways) ===
+local function getPaddedWallTransform(startPos: Vector3, endPos: Vector3)
+	local direction = endPos - startPos
+	local unitDir = direction.Unit
+	local halfThick = WallBuildConfig.WallThickness / 2
+
+	local paddedStart = startPos - (unitDir * halfThick)
+	local paddedEnd = endPos + (unitDir * halfThick)
+
+	local paddedLength = (paddedEnd - paddedStart).Magnitude
+	local angle = math.atan2(direction.X, direction.Z)
+	local midpoint = (paddedStart + paddedEnd) / 2
+	midpoint = Vector3.new(midpoint.X, startPos.Y + WallBuildConfig.WallHeight / 2, midpoint.Z)
+
+	local cframe = CFrame.new(midpoint) * CFrame.Angles(0, angle, 0)
+	local size = Vector3.new(WallBuildConfig.WallThickness, WallBuildConfig.WallHeight, paddedLength)
+
+	return cframe, size
+end
+
+-- === Door swing registration ===
 
 local function registerDoorLeaf(leaf: BasePart, hingeLocalZ: number, isSliding: boolean?)
 	leaf:SetAttribute("HingeLocalZ", hingeLocalZ)
@@ -128,7 +136,6 @@ local function setDoorLeafOpen(leaf: BasePart, open: boolean)
 	local targetCFrame
 
 	if state.isSliding then
-		-- Sliding doors translate along local Z instead of rotating
 		local slideSign = hingeLocalZ > 0 and 1 or -1
 		local slideDistance = math.abs(hingeLocalZ) * 2
 		if open then
@@ -151,9 +158,6 @@ local function setDoorLeafOpen(leaf: BasePart, open: boolean)
 	state.tween:Play()
 end
 
--- Polls players AND NPCs (customers + hired employees) every ~0.3s. Doors
--- swing open for anyone nearby, closed once everyone's clear — this is a real
--- open/close animation, not the old "turn invisible" hack.
 local function getAllNearbyPositions(): {Vector3}
 	local positions = {}
 	for _, plr in ipairs(Players:GetPlayers()) do
@@ -209,12 +213,7 @@ local function placeWall(player: Player, data)
 	if not plot then return end
 	if not isWithinPlotBounds(plot, startPos) or not isWithinPlotBounds(plot, endPos) then return end
 
-	local angle = math.atan2(direction.X, direction.Z)
-	local midpoint = (startPos + endPos) / 2
-	midpoint = Vector3.new(midpoint.X, startPos.Y + WallBuildConfig.WallHeight / 2, midpoint.Z)
-
-	local cframe = CFrame.new(midpoint) * CFrame.Angles(0, angle, 0)
-	local size = Vector3.new(WallBuildConfig.WallThickness, WallBuildConfig.WallHeight, length)
+	local cframe, size = getPaddedWallTransform(startPos, endPos)
 
 	local model = Instance.new("Model")
 	model.Name = "Wall"
@@ -222,8 +221,6 @@ local function placeWall(player: Player, data)
 	model:SetAttribute("BuildId", nextBuildId())
 	storeWallInfo(model, cframe, size)
 
-	-- Named "Color1" (not "Wall") so it's automatically paintable through the
-	-- existing paint system, same convention every other piece of furniture uses.
 	local wallPart = createPart("Color1", size, cframe, WallBuildConfig.Colors.Wall, WallBuildConfig.Materials.Wall, "Wall")
 	wallPart.Parent = model
 	model.Parent = getBuildObjects(plot)
@@ -245,11 +242,19 @@ local function placeFloor(player: Player, data)
 	if not isWithinPlotBounds(plot, pos) then return end
 
 	local cframe = CFrame.new(pos.X, pos.Y + size.Y / 2, pos.Z) * CFrame.Angles(0, math.rad(rot), 0)
+
+	-- Group floor into a Model so PaintClient targets all tiles together via BuildId
+	local floorModel = Instance.new("Model")
+	floorModel.Name = "Floor"
+	floorModel:SetAttribute("BuildType", "FloorModel")
+	floorModel:SetAttribute("BuildId", nextBuildId())
+
 	local part = createPart("Color1", size, cframe, WallBuildConfig.Colors.Floor, WallBuildConfig.Materials.Floor, "Floor")
-	part:SetAttribute("IsFloor", true) -- so furniture placement ignores it for overlap (see BuildServer)
-	part:SetAttribute("BuildId", nextBuildId())
+	part:SetAttribute("IsFloor", true)
 	CollectionService:AddTag(part, "Object_IgnoreCollision")
-	part.Parent = getBuildObjects(plot)
+	part.Parent = floorModel
+
+	floorModel.Parent = getBuildObjects(plot)
 
 	recordBuild(player, { kind = "Floor", pos = {pos.X, pos.Y, pos.Z}, size = {size.X, size.Y, size.Z}, rotation = rot })
 end
@@ -263,14 +268,21 @@ local function placeRoof(player: Player, data)
 	if not isWithinPlotBounds(plot, pos) then return end
 
 	local cframe = CFrame.new(pos) * CFrame.Angles(0, math.rad(rot), 0)
+
+	local roofModel = Instance.new("Model")
+	roofModel.Name = "Roof"
+	roofModel:SetAttribute("BuildType", "RoofModel")
+	roofModel:SetAttribute("BuildId", nextBuildId())
+
 	local part = createPart("Color1", size, cframe, WallBuildConfig.Colors.Roof, WallBuildConfig.Materials.Roof, "Roof")
-	part:SetAttribute("BuildId", nextBuildId())
-	part.Parent = getBuildObjects(plot)
+	part.Parent = roofModel
+
+	roofModel.Parent = getBuildObjects(plot)
 
 	recordBuild(player, { kind = "Roof", pos = {pos.X, pos.Y, pos.Z}, size = {size.X, size.Y, size.Z}, rotation = rot })
 end
 
--- ===== DOOR (3-piece split; supports single, double, and sliding types) =====
+-- ===== DOOR =====
 
 local function placeDoor(player: Player, data)
 	local wallPart: BasePart = data.wallPart
@@ -283,7 +295,7 @@ local function placeDoor(player: Player, data)
 	if not model or model:GetAttribute("BuildType") ~= "WallModel" then return end
 	if wallPart:GetAttribute("BuildType") ~= "Wall" then return end
 
-local plot
+	local plot
 	if data._restoring then
 		plot = model:FindFirstAncestorOfClass("Model")
 		local plots = workspace:FindFirstChild("Plots")
@@ -355,7 +367,7 @@ local plot
 	end
 end
 
--- ===== WINDOW (4-piece split, static; supports multiple window types) =====
+-- ===== WINDOW =====
 
 local function placeWindow(player: Player, data)
 	local wallPart: BasePart = data.wallPart
@@ -368,7 +380,7 @@ local function placeWindow(player: Player, data)
 	if not model or model:GetAttribute("BuildType") ~= "WallModel" then return end
 	if wallPart:GetAttribute("BuildType") ~= "Wall" then return end
 
-local plot
+	local plot
 	if data._restoring then
 		plot = model:FindFirstAncestorOfClass("Model")
 		local plots = workspace:FindFirstChild("Plots")
@@ -472,11 +484,15 @@ local function deleteBuild(player: Player, data)
 			part:Destroy()
 		end
 	elseif buildType == "Floor" or buildType == "Roof" then
-		part:Destroy()
+		if model:IsA("Model") and (model:GetAttribute("BuildType") == "FloorModel" or model:GetAttribute("BuildType") == "RoofModel") then
+			model:Destroy()
+		else
+			part:Destroy()
+		end
 	end
 end
 
--- ===== RESTORE (replay saved records to rebuild exact same structures) =====
+-- ===== RESTORE =====
 
 local function reconstructWall(plot: Model, record): Model?
 	local startPos = Vector3.new(record.startPos[1], record.startPos[2], record.startPos[3])
@@ -485,11 +501,7 @@ local function reconstructWall(plot: Model, record): Model?
 	local length = Vector3.new(direction.X, 0, direction.Z).Magnitude
 	if length < 1 then return nil end
 
-	local angle = math.atan2(direction.X, direction.Z)
-	local midpoint = (startPos + endPos) / 2
-	midpoint = Vector3.new(midpoint.X, startPos.Y + WallBuildConfig.WallHeight / 2, midpoint.Z)
-	local cframe = CFrame.new(midpoint) * CFrame.Angles(0, angle, 0)
-	local size = Vector3.new(WallBuildConfig.WallThickness, WallBuildConfig.WallHeight, length)
+	local cframe, size = getPaddedWallTransform(startPos, endPos)
 
 	local model = Instance.new("Model")
 	model.Name = "Wall"
@@ -506,20 +518,34 @@ local function reconstructFloor(plot: Model, record)
 	local pos = Vector3.new(record.pos[1], record.pos[2], record.pos[3])
 	local size = Vector3.new(record.size[1], record.size[2], record.size[3])
 	local cframe = CFrame.new(pos.X, pos.Y + size.Y / 2, pos.Z) * CFrame.Angles(0, math.rad(record.rotation or 0), 0)
+
+	local floorModel = Instance.new("Model")
+	floorModel.Name = "Floor"
+	floorModel:SetAttribute("BuildType", "FloorModel")
+	floorModel:SetAttribute("BuildId", nextBuildId())
+
 	local part = createPart("Color1", size, cframe, WallBuildConfig.Colors.Floor, WallBuildConfig.Materials.Floor, "Floor")
 	part:SetAttribute("IsFloor", true)
-	part:SetAttribute("BuildId", nextBuildId())
 	CollectionService:AddTag(part, "Object_IgnoreCollision")
-	part.Parent = getBuildObjects(plot)
+	part.Parent = floorModel
+
+	floorModel.Parent = getBuildObjects(plot)
 end
 
 local function reconstructRoof(plot: Model, record)
 	local pos = Vector3.new(record.pos[1], record.pos[2], record.pos[3])
 	local size = Vector3.new(record.size[1], record.size[2], record.size[3])
 	local cframe = CFrame.new(pos) * CFrame.Angles(0, math.rad(record.rotation or 0), 0)
+
+	local roofModel = Instance.new("Model")
+	roofModel.Name = "Roof"
+	roofModel:SetAttribute("BuildType", "RoofModel")
+	roofModel:SetAttribute("BuildId", nextBuildId())
+
 	local roofPart = createPart("Color1", size, cframe, WallBuildConfig.Colors.Roof, WallBuildConfig.Materials.Roof, "Roof")
-	roofPart:SetAttribute("BuildId", nextBuildId())
-	roofPart.Parent = getBuildObjects(plot)
+	roofPart.Parent = roofModel
+
+	roofModel.Parent = getBuildObjects(plot)
 end
 
 local function findWallPart(model: Model): BasePart?
@@ -553,9 +579,6 @@ local function reconstructWindow(model: Model, record)
 	})
 end
 
--- Rebuilds every saved wall/floor/roof/door/window for a plot, in the order
--- they were originally placed (doors/windows always come after the wall
--- record they split, since you can't split a wall before it exists).
 function Service.restoreWallBuilds(player: Player, plot: Model)
 	local dataService = cachedModules.Cache.DataService
 	local playerData = dataService and dataService.getData(player)
@@ -584,8 +607,6 @@ function Service.restoreWallBuilds(player: Player, plot: Model)
 	end
 end
 
--- Public wrapper so Server.lua's DeleteObject handler can route wall-build
--- deletes through WallBuildService's proper stitch/delete logic.
 function Service.deleteBuildViaPart(player: Player, part: BasePart)
 	deleteBuild(player, { part = part })
 end
