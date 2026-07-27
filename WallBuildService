@@ -4,12 +4,21 @@ local CollectionService = game:GetService("CollectionService")
 local TweenService = game:GetService("TweenService")
 
 local WallBuildConfig = require(ReplicatedStorage.Modules.WallBuildConfig)
-local cachedModules = require(script.Parent.Parent.Server.CachedModules)
+local cachedModules = require(game:GetService("ServerScriptService").Server.CachedModules)
 
 local remotes = ReplicatedStorage:WaitForChild("RemoteEvents")
 local wallBuildEvent = remotes:WaitForChild("WallBuildAction")
 
 local Service = {}
+
+-- BuildId counter for wall-build objects (offset to avoid collision with
+-- Server.lua's furniture BuildId counter which starts at 1)
+local wallBuildIdCounter = 100000
+
+local function nextBuildId(): number
+	wallBuildIdCounter += 1
+	return wallBuildIdCounter
+end
 
 -- doorRegistry[doorLeafPart] = { hingeSide = 1 or -1, isOpen = false, tween = nil }
 local doorRegistry: {[BasePart]: any} = {}
@@ -102,10 +111,10 @@ end
 -- === Door swing registration (both single and double doors register one
 -- === entry per leaf, so a double door is just two leaves swinging opposite ways) ===
 
-local function registerDoorLeaf(leaf: BasePart, hingeLocalZ: number)
+local function registerDoorLeaf(leaf: BasePart, hingeLocalZ: number, isSliding: boolean?)
 	leaf:SetAttribute("HingeLocalZ", hingeLocalZ)
 	leaf:SetAttribute("ClosedCFrameOffset", true)
-	doorRegistry[leaf] = { isOpen = false, closedCFrame = leaf.CFrame }
+	doorRegistry[leaf] = { isOpen = false, closedCFrame = leaf.CFrame, isSliding = isSliding or false }
 	CollectionService:AddTag(leaf, "AutoDoorLeaf")
 end
 
@@ -118,12 +127,23 @@ local function setDoorLeafOpen(leaf: BasePart, open: boolean)
 	local closedCFrame = state.closedCFrame
 	local targetCFrame
 
-	if open then
-		local hingeWorld = closedCFrame * CFrame.new(0, 0, hingeLocalZ)
-		local swingSign = hingeLocalZ > 0 and -1 or 1 -- swing away from whichever edge it's hinged on
-		targetCFrame = hingeWorld * CFrame.Angles(0, math.rad(WallBuildConfig.DoorSwingAngle * swingSign), 0) * CFrame.new(0, 0, -hingeLocalZ)
+	if state.isSliding then
+		-- Sliding doors translate along local Z instead of rotating
+		local slideSign = hingeLocalZ > 0 and 1 or -1
+		local slideDistance = math.abs(hingeLocalZ) * 2
+		if open then
+			targetCFrame = closedCFrame * CFrame.new(0, 0, slideSign * slideDistance)
+		else
+			targetCFrame = closedCFrame
+		end
 	else
-		targetCFrame = closedCFrame
+		if open then
+			local hingeWorld = closedCFrame * CFrame.new(0, 0, hingeLocalZ)
+			local swingSign = hingeLocalZ > 0 and -1 or 1
+			targetCFrame = hingeWorld * CFrame.Angles(0, math.rad(WallBuildConfig.DoorSwingAngle * swingSign), 0) * CFrame.new(0, 0, -hingeLocalZ)
+		else
+			targetCFrame = closedCFrame
+		end
 	end
 
 	if state.tween then state.tween:Cancel() end
@@ -199,6 +219,7 @@ local function placeWall(player: Player, data)
 	local model = Instance.new("Model")
 	model.Name = "Wall"
 	model:SetAttribute("BuildType", "WallModel")
+	model:SetAttribute("BuildId", nextBuildId())
 	storeWallInfo(model, cframe, size)
 
 	-- Named "Color1" (not "Wall") so it's automatically paintable through the
@@ -226,6 +247,7 @@ local function placeFloor(player: Player, data)
 	local cframe = CFrame.new(pos.X, pos.Y + size.Y / 2, pos.Z) * CFrame.Angles(0, math.rad(rot), 0)
 	local part = createPart("Color1", size, cframe, WallBuildConfig.Colors.Floor, WallBuildConfig.Materials.Floor, "Floor")
 	part:SetAttribute("IsFloor", true) -- so furniture placement ignores it for overlap (see BuildServer)
+	part:SetAttribute("BuildId", nextBuildId())
 	CollectionService:AddTag(part, "Object_IgnoreCollision")
 	part.Parent = getBuildObjects(plot)
 
@@ -242,17 +264,19 @@ local function placeRoof(player: Player, data)
 
 	local cframe = CFrame.new(pos) * CFrame.Angles(0, math.rad(rot), 0)
 	local part = createPart("Color1", size, cframe, WallBuildConfig.Colors.Roof, WallBuildConfig.Materials.Roof, "Roof")
+	part:SetAttribute("BuildId", nextBuildId())
 	part.Parent = getBuildObjects(plot)
 
 	recordBuild(player, { kind = "Roof", pos = {pos.X, pos.Y, pos.Z}, size = {size.X, size.Y, size.Z}, rotation = rot })
 end
 
--- ===== DOOR (3-piece split; supports single OR double leaves) =====
+-- ===== DOOR (3-piece split; supports single, double, and sliding types) =====
 
 local function placeDoor(player: Player, data)
 	local wallPart: BasePart = data.wallPart
 	local position: Vector3 = data.position
-	local isDouble: boolean = data.isDouble == true
+	local doorStyle: string = data.doorStyle or "Single"
+	local doorType = WallBuildConfig.DoorTypes[doorStyle] or WallBuildConfig.DoorTypes.Single
 
 	if not wallPart or not wallPart.Parent then return end
 	local model = wallPart.Parent
@@ -273,7 +297,7 @@ local plot
 
 	local wallCFrame, wallSize = wallPart.CFrame, wallPart.Size
 	local thickness, height, length = wallSize.X, wallSize.Y, wallSize.Z
-	local doorWidth, doorHeight = WallBuildConfig.DoorWidth, WallBuildConfig.DoorHeight
+	local doorWidth, doorHeight = doorType.width, doorType.height
 	if height < doorHeight then return end
 
 	local localZ = wallCFrame:ToObjectSpace(CFrame.new(position)).Z
@@ -304,37 +328,40 @@ local plot
 	end
 
 	local doorCenterY = -height / 2 + doorHeight / 2
-	local doorThickness = thickness + 0.15
+	local doorThickness = (doorType.thickness or 0.2) + 0.15
+	local isSliding = not doorType.swing
 
-	if isDouble then
+	if (doorType.leaves or 1) >= 2 then
 		local leafWidth = doorWidth / 2
 		local leftCenterZ = localZ - leafWidth / 2
 		local rightCenterZ = localZ + leafWidth / 2
 
-		local leftLeaf = createPart("Door", Vector3.new(doorThickness, doorHeight, leafWidth), wallCFrame * CFrame.new(0, doorCenterY, leftCenterZ), WallBuildConfig.Colors.Door, WallBuildConfig.Materials.Door, "Door")
+		local leftLeaf = createPart("Door", Vector3.new(doorThickness, doorHeight, leafWidth), wallCFrame * CFrame.new(0, doorCenterY, leftCenterZ), WallBuildConfig.Colors.DoorDefault, WallBuildConfig.Materials.Door, "Door")
 		leftLeaf.Parent = model
-		registerDoorLeaf(leftLeaf, -leafWidth / 2) -- hinged on its own outer (far-left) edge
+		registerDoorLeaf(leftLeaf, -leafWidth / 2, isSliding)
 
-		local rightLeaf = createPart("Door", Vector3.new(doorThickness, doorHeight, leafWidth), wallCFrame * CFrame.new(0, doorCenterY, rightCenterZ), WallBuildConfig.Colors.Door, WallBuildConfig.Materials.Door, "Door")
+		local rightLeaf = createPart("Door", Vector3.new(doorThickness, doorHeight, leafWidth), wallCFrame * CFrame.new(0, doorCenterY, rightCenterZ), WallBuildConfig.Colors.DoorDefault, WallBuildConfig.Materials.Door, "Door")
 		rightLeaf.Parent = model
-		registerDoorLeaf(rightLeaf, leafWidth / 2) -- hinged on its own outer (far-right) edge
+		registerDoorLeaf(rightLeaf, leafWidth / 2, isSliding)
 	else
 		local doorCFrame = wallCFrame * CFrame.new(0, doorCenterY, localZ)
-		local door = createPart("Door", Vector3.new(doorThickness, doorHeight, doorWidth), doorCFrame, WallBuildConfig.Colors.Door, WallBuildConfig.Materials.Door, "Door")
+		local door = createPart("Door", Vector3.new(doorThickness, doorHeight, doorWidth), doorCFrame, WallBuildConfig.Colors.DoorDefault, WallBuildConfig.Materials.Door, "Door")
 		door.Parent = model
-		registerDoorLeaf(door, -doorWidth / 2) -- hinged on the left edge
+		registerDoorLeaf(door, -doorWidth / 2, isSliding)
 	end
 
 	if not data._restoring then
-		recordBuild(player, { kind = "Door", wallRecordIndex = model:GetAttribute("RecordIndex"), position = {position.X, position.Y, position.Z}, isDouble = isDouble })
+		recordBuild(player, { kind = "Door", wallRecordIndex = model:GetAttribute("RecordIndex"), position = {position.X, position.Y, position.Z}, doorStyle = doorStyle })
 	end
 end
 
--- ===== WINDOW (4-piece split, static) =====
+-- ===== WINDOW (4-piece split, static; supports multiple window types) =====
 
 local function placeWindow(player: Player, data)
 	local wallPart: BasePart = data.wallPart
 	local position: Vector3 = data.position
+	local windowStyle: string = data.windowStyle or "Standard"
+	local windowType = WallBuildConfig.WindowTypes[windowStyle] or WallBuildConfig.WindowTypes.Standard
 
 	if not wallPart or not wallPart.Parent then return end
 	local model = wallPart.Parent
@@ -355,7 +382,7 @@ local plot
 
 	local wallCFrame, wallSize = wallPart.CFrame, wallPart.Size
 	local thickness, height, length = wallSize.X, wallSize.Y, wallSize.Z
-	local windowWidth, windowHeight, sillHeight = WallBuildConfig.WindowWidth, WallBuildConfig.WindowHeight, WallBuildConfig.WindowSillHeight
+	local windowWidth, windowHeight, sillHeight = windowType.width, windowType.height, windowType.sillHeight
 	if height < (sillHeight + windowHeight) then return end
 
 	local localZ = wallCFrame:ToObjectSpace(CFrame.new(position)).Z
@@ -393,13 +420,14 @@ local plot
 		createPart("Color1", Vector3.new(thickness, aboveHeight, windowWidth), aboveCFrame, WallBuildConfig.Colors.Wall, WallBuildConfig.Materials.Wall, "WallSegment").Parent = model
 	end
 
+	local windowThickness = (windowType.thickness or 0.15) + 0.15
 	local windowCFrame = wallCFrame * CFrame.new(0, windowBottom + windowHeight / 2, localZ)
-	local window = createPart("Window", Vector3.new(thickness + 0.15, windowHeight, windowWidth), windowCFrame, WallBuildConfig.Colors.Window, WallBuildConfig.Materials.Window, "Window")
+	local window = createPart("Window", Vector3.new(windowThickness, windowHeight, windowWidth), windowCFrame, WallBuildConfig.Colors.Window, WallBuildConfig.Materials.Window, "Window")
 	window.Transparency = 0.3
 	window.Parent = model
 
 	if not data._restoring then
-		recordBuild(player, { kind = "Window", wallRecordIndex = model:GetAttribute("RecordIndex"), position = {position.X, position.Y, position.Z} })
+		recordBuild(player, { kind = "Window", wallRecordIndex = model:GetAttribute("RecordIndex"), position = {position.X, position.Y, position.Z}, windowStyle = windowStyle })
 	end
 end
 
@@ -466,6 +494,7 @@ local function reconstructWall(plot: Model, record): Model?
 	local model = Instance.new("Model")
 	model.Name = "Wall"
 	model:SetAttribute("BuildType", "WallModel")
+	model:SetAttribute("BuildId", nextBuildId())
 	storeWallInfo(model, cframe, size)
 
 	createPart("Color1", size, cframe, WallBuildConfig.Colors.Wall, WallBuildConfig.Materials.Wall, "Wall").Parent = model
@@ -479,6 +508,7 @@ local function reconstructFloor(plot: Model, record)
 	local cframe = CFrame.new(pos.X, pos.Y + size.Y / 2, pos.Z) * CFrame.Angles(0, math.rad(record.rotation or 0), 0)
 	local part = createPart("Color1", size, cframe, WallBuildConfig.Colors.Floor, WallBuildConfig.Materials.Floor, "Floor")
 	part:SetAttribute("IsFloor", true)
+	part:SetAttribute("BuildId", nextBuildId())
 	CollectionService:AddTag(part, "Object_IgnoreCollision")
 	part.Parent = getBuildObjects(plot)
 end
@@ -487,7 +517,9 @@ local function reconstructRoof(plot: Model, record)
 	local pos = Vector3.new(record.pos[1], record.pos[2], record.pos[3])
 	local size = Vector3.new(record.size[1], record.size[2], record.size[3])
 	local cframe = CFrame.new(pos) * CFrame.Angles(0, math.rad(record.rotation or 0), 0)
-	createPart("Color1", size, cframe, WallBuildConfig.Colors.Roof, WallBuildConfig.Materials.Roof, "Roof").Parent = getBuildObjects(plot)
+	local roofPart = createPart("Color1", size, cframe, WallBuildConfig.Colors.Roof, WallBuildConfig.Materials.Roof, "Roof")
+	roofPart:SetAttribute("BuildId", nextBuildId())
+	roofPart.Parent = getBuildObjects(plot)
 end
 
 local function findWallPart(model: Model): BasePart?
@@ -505,7 +537,7 @@ local function reconstructDoor(model: Model, record)
 	placeDoor(nil :: any, {
 		wallPart = wallPart,
 		position = Vector3.new(record.position[1], record.position[2], record.position[3]),
-		isDouble = record.isDouble,
+		doorStyle = record.doorStyle or "Single",
 		_restoring = true,
 	})
 end
@@ -516,6 +548,7 @@ local function reconstructWindow(model: Model, record)
 	placeWindow(nil :: any, {
 		wallPart = wallPart,
 		position = Vector3.new(record.position[1], record.position[2], record.position[3]),
+		windowStyle = record.windowStyle or "Standard",
 		_restoring = true,
 	})
 end
@@ -549,6 +582,12 @@ function Service.restoreWallBuilds(player: Player, plot: Model)
 			if model then reconstructWindow(model, record) end
 		end
 	end
+end
+
+-- Public wrapper so Server.lua's DeleteObject handler can route wall-build
+-- deletes through WallBuildService's proper stitch/delete logic.
+function Service.deleteBuildViaPart(player: Player, part: BasePart)
+	deleteBuild(player, { part = part })
 end
 
 function Service.init()
