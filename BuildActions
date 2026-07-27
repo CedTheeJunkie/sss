@@ -1,0 +1,231 @@
+local SoundService = game:GetService("SoundService")
+local UserInputS = game:GetService("UserInputService")
+local RepS = game:GetService("ReplicatedStorage")
+local Players = game:GetService("Players")
+
+local shared = RepS.BuildMode
+local events = RepS.RemoteEvents
+
+local Settings = require(shared.Settings)
+local BuildHistory = require(shared.Modules.BuildHistory)
+
+local modules = script.Parent:WaitForChild("Modules")
+local PlacingService = require(modules.PlacingService)
+
+local General = require(shared.Utility.General)
+
+local player: Player = Players.LocalPlayer
+local playerGui = player:WaitForChild("PlayerGui")
+local buildGui = playerGui:WaitForChild("Build")
+
+local ActingPlotResolver = require(game:GetService("ReplicatedStorage").Modules.ActingPlotResolver)
+
+local function getPlot(): Model?
+	return ActingPlotResolver.getActingPlot(player, true)
+end
+
+local toolbar = buildGui:WaitForChild("Toolbar")
+local undoButton = toolbar:WaitForChild("Undo")
+local redoButton = toolbar:WaitForChild("Redo")
+local deleteButton = toolbar:WaitForChild("Delete")
+local gridButton = toolbar:WaitForChild("Grid")
+local gridSizeLabel = gridButton:WaitForChild("GridSizeLabel")
+local collisionButton = toolbar:WaitForChild("Collision")
+
+local cancelFrame = buildGui:WaitForChild("CancelFrame")
+local cancelButton = cancelFrame:WaitForChild("CancelButton")
+
+local undoStack = BuildHistory.undoStack
+local redoStack = BuildHistory.redoStack
+
+local deleteMode = false
+local originalDeleteColor = deleteButton.ImageColor3
+
+local gridIndex = 3
+local function getCurrentGridSize()
+	return Settings.GridSizes[gridIndex]
+end
+local function updateGridLabel()
+	gridSizeLabel.Text = tostring(getCurrentGridSize())
+end
+
+Settings.GridUnit = getCurrentGridSize()
+updateGridLabel()
+player:SetAttribute("GridUnit", Settings.GridUnit)
+
+local function enterDeleteMode()
+	deleteMode = true
+	player:SetAttribute("DeleteMode", true)
+	deleteButton.ImageColor3 = Color3.fromRGB(255, 100, 100)
+	PlacingService.Cancel()
+end
+
+local function exitDeleteMode()
+	deleteMode = false
+	player:SetAttribute("DeleteMode", false)
+	deleteButton.ImageColor3 = originalDeleteColor
+end
+
+local placeSoundTemplate = SoundService:FindFirstChild("SFX") and SoundService.SFX:FindFirstChild("Object Placed")
+
+events.PlacementResult.OnClientEvent:Connect(function(result)
+	BuildHistory.pushUndo({
+		action = "Place",
+		objectName = result.ObjectName,
+		cframe = result.CF,
+		objectId = result.ObjectId,
+	})
+
+	-- Local-only thunk \226\128\148 only the person placing hears it, not the whole server
+	if placeSoundTemplate and placeSoundTemplate.SoundId ~= "" then
+		local placeSound = placeSoundTemplate:Clone()
+		placeSound.Parent = SoundService
+		placeSound.Ended:Connect(function()
+			placeSound:Destroy()
+		end)
+		placeSound:Play()
+	end
+end)
+
+undoButton.MouseButton1Click:Connect(function()
+	if BuildHistory.undoCount() == 0 then return end
+
+	local action = BuildHistory.popUndo()
+
+	if action.action == "Place" then
+		events.DeleteObject:FireServer({ObjectId = action.objectId, Reason = "undo"})
+		BuildHistory.pushRedo(action)
+	elseif action.action == "Delete" then
+		events.RestoreObject:FireServer({ObjectId = action.objectId, Reason = "undo"})
+		BuildHistory.pushRedo(action)
+	elseif action.action == "Move" then
+		events.MoveObject:FireServer({ObjectId = action.objectId, CF = action.oldCF})
+		BuildHistory.pushRedo(action)
+	end
+end)
+
+redoButton.MouseButton1Click:Connect(function()
+	if BuildHistory.redoCount() == 0 then return end
+
+	local action = BuildHistory.popRedo()
+
+	if action.action == "Place" then
+		events.RestoreObject:FireServer({ObjectId = action.objectId, Reason = "redo"})
+		BuildHistory.pushUndo(action)
+	elseif action.action == "Delete" then
+		events.DeleteObject:FireServer({ObjectId = action.objectId, Reason = "redo"})
+		BuildHistory.pushUndo(action)
+	elseif action.action == "Move" then
+		events.MoveObject:FireServer({ObjectId = action.objectId, CF = action.newCF})
+		BuildHistory.pushUndo(action)
+	end
+end)
+
+gridButton.MouseButton1Click:Connect(function()
+	gridIndex = gridIndex + 1
+	if gridIndex > #Settings.GridSizes then
+		gridIndex = 1
+	end
+	Settings.GridUnit = getCurrentGridSize()
+	updateGridLabel()
+	player:SetAttribute("GridUnit", Settings.GridUnit)
+end)
+
+deleteButton.MouseButton1Click:Connect(function()
+	if deleteMode then
+		exitDeleteMode()
+	else
+		enterDeleteMode()
+	end
+end)
+
+cancelButton.MouseButton1Click:Connect(function()
+	if deleteMode then
+		exitDeleteMode()
+	end
+	if player:GetAttribute("IsMovingBuild") then
+		player:SetAttribute("CancelMoveRequest", not player:GetAttribute("CancelMoveRequest"))
+	end
+
+	if PlacingService.GetPreview() then
+		PlacingService.Cancel()
+	end
+end)
+
+local function tryDeleteAtTarget()
+	if not deleteMode then return end
+
+	local plot: Model? = getPlot()
+	if not plot then return end
+
+	local buildObjects: Folder? = plot:FindFirstChild("BuildObjects")
+	if not buildObjects then return end
+
+	local raycastParams: RaycastParams = RaycastParams.new()
+	raycastParams.FilterType = Enum.RaycastFilterType.Include
+	raycastParams.FilterDescendantsInstances = { buildObjects }
+
+	local result: RaycastResult? = General.GetMouseResult(raycastParams)
+	if not result then return end
+
+	local hitInstance: Instance = result.Instance
+	local targetObject: Instance? = hitInstance
+
+	while targetObject and targetObject.Parent ~= buildObjects do
+		targetObject = targetObject.Parent
+	end
+
+	if not targetObject then return end
+
+	local objectId: number? = targetObject:GetAttribute("BuildId")
+	if not objectId then return end
+
+	local objectName: string = targetObject.Name
+	local cframe: CFrame = targetObject:GetPivot()
+
+	events.DeleteObject:FireServer({ObjectId = objectId, Reason = "delete"})
+
+	BuildHistory.pushUndo({
+		action = "Delete",
+		objectName = objectName,
+		cframe = cframe,
+		objectId = objectId,
+	})
+end
+
+UserInputS.InputBegan:Connect(function(input: InputObject, gameProcessed: boolean)
+	if gameProcessed then return end
+	if not deleteMode then return end
+
+	local isConfirmInput = input.UserInputType == Enum.UserInputType.MouseButton1
+		or input.UserInputType == Enum.UserInputType.Touch
+		or input.KeyCode == Enum.KeyCode.ButtonA
+
+	if not isConfirmInput then return end
+
+	tryDeleteAtTarget()
+end)
+
+local collisionDisabled = false
+local originalCollisionColor = collisionButton.ImageColor3
+collisionButton.MouseButton1Click:Connect(function()
+	local toggleCollisionsEvent = events:FindFirstChild("ToggleCollisions")
+	if toggleCollisionsEvent then
+		toggleCollisionsEvent:FireServer()
+	end
+end)
+
+events.ToggleCollisions.OnClientEvent:Connect(function(disabled: boolean)
+	collisionDisabled = disabled
+	if disabled then
+		collisionButton.ImageColor3 = Color3.fromRGB(100, 200, 100)
+	else
+		collisionButton.ImageColor3 = originalCollisionColor
+	end
+end)
+
+buildGui:GetPropertyChangedSignal("Enabled"):Connect(function()
+	if not buildGui.Enabled then
+		exitDeleteMode()
+	end
+end)
