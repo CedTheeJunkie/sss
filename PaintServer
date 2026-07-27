@@ -1,0 +1,95 @@
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local ServerScriptService = game:GetService("ServerScriptService")
+
+local events = ReplicatedStorage:WaitForChild("RemoteEvents")
+local paintEvent = events:WaitForChild("PaintEvent")
+local PlotService = require(ServerScriptService.Services.PlotService)
+local RateLimiter = require(ServerScriptService.Services.RateLimiter)
+
+local function getZoneParts(zone)
+	local parts = {}
+	if zone:IsA("BasePart") then
+		table.insert(parts, zone)
+	elseif zone:IsA("Model") then
+		for _, desc in zone:GetDescendants() do
+			if desc:IsA("BasePart") then
+				table.insert(parts, desc)
+			end
+		end
+	end
+	return parts
+end
+
+paintEvent.OnServerEvent:Connect(function(player, payload)
+	if not RateLimiter.guard(player, "PaintEvent", 20, 5) then return end
+	if typeof(payload) ~= "table" then return end
+	local objectId = payload.ObjectId
+	local paintData = payload.PaintData
+
+	if typeof(objectId) ~= "number" then return end
+	if typeof(paintData) ~= "table" then return end
+
+	
+	local plot = PlotService.getActingPlot(player, true) 
+	if not plot then
+		warn("[PaintServer] " .. player.Name .. " has no assigned plot — paint request rejected")
+		return
+	end
+
+	local buildObjects = plot:FindFirstChild("BuildObjects")
+	if not buildObjects then return end
+
+	local targetObject = nil
+	for _, obj in buildObjects:GetChildren() do
+		if obj:GetAttribute("BuildId") == objectId then
+			targetObject = obj
+			break
+		end
+	end
+
+	if not targetObject then
+		warn("[PaintServer] Object with BuildId " .. objectId .. " not found in " .. player.Name .. "'s plot")
+		return
+	end
+	
+	for _, zoneInfo in ipairs(paintData) do
+		local zoneNum = zoneInfo.ZoneIndex
+		if typeof(zoneNum) == "number" and zoneNum >= 1 and zoneNum <= 4 then
+			local zoneName = "Color" .. zoneNum
+			-- Collect ALL children matching the zone name, not just the first.
+			-- Wall models have multiple "Color1" parts (segments, headers, etc.)
+			local allParts = {}
+			-- If the object itself is a BasePart matching the zone name, include it
+			-- (e.g. WallBuildService floors are bare Parts named "Color1")
+			if targetObject:IsA("BasePart") and targetObject.Name == zoneName then
+				table.insert(allParts, targetObject)
+			end
+			for _, child in targetObject:GetChildren() do
+				if child.Name == zoneName then
+					local zoneParts = getZoneParts(child)
+					for _, p in zoneParts do
+						table.insert(allParts, p)
+					end
+				end
+			end
+
+			for _, part in allParts do
+				if zoneInfo.Color and typeof(zoneInfo.Color) == "Color3" then
+					part.Color = zoneInfo.Color
+				end
+				if zoneInfo.Material and typeof(zoneInfo.Material) == "EnumItem" then
+					part.Material = zoneInfo.Material
+				end
+			end
+
+			if zoneInfo.Color then
+				targetObject:SetAttribute("Paint_Color" .. zoneNum, zoneInfo.Color)
+			end
+			if zoneInfo.Material then
+				targetObject:SetAttribute("Paint_Material" .. zoneNum, zoneInfo.Material)
+			end
+		end 
+	end 
+
+	PlotService.savePlotState(player)
+end)
