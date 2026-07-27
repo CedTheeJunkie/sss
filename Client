@@ -1,0 +1,558 @@
+local UserInputS = game:GetService("UserInputService")
+local RepS = game:GetService("ReplicatedStorage")
+local Players = game:GetService("Players")
+local ContextActionService = game:GetService("ContextActionService")
+
+local modules = script.Parent.Modules
+local shared = RepS.BuildMode
+local events = RepS.RemoteEvents
+
+local libraries = RepS.Libraries
+
+local Settings = require(shared.Settings)
+
+local Trove = require(libraries.Trove)
+local LemonSignal = require(libraries.LemonSignal)
+
+local PlacingService = require(modules.PlacingService)
+local WallBuildToolManager = require(modules.WallBuildToolManager)
+
+local player: Player = Players.LocalPlayer
+local Build: ScreenGui = player.PlayerGui:WaitForChild("Build")
+
+local guiVisual: Folder = Build.Visual
+
+local previewHighlight: Highlight = guiVisual.PreviewHighlight
+
+local canPlaceColor: Color3 = Settings.CanPlaceColor
+local cannotPlaceColor: Color3 = Settings.CannotPlaceColor
+
+local previewTrove: Trove = Trove.new()
+local renderedEvent: Signal<Instance, number, boolean> = PlacingService.Rendered
+
+type Trove = Trove.Trove
+type Signal<T...> = LemonSignal.Signal<T...>
+
+local cancelFrame: Frame = Build.CancelFrame
+local mobileAccept: ImageButton = cancelFrame:WaitForChild("MobileAccept")
+local mobileRotate: ImageButton = cancelFrame:WaitForChild("MobileRotate")
+local currentObjectName: string? = nil
+
+const PLACEMENT_GAMEPAD_ACTION = "BuildPlacementInput"
+
+local categories = {
+	{frame = Build.Furniture, templateName = "BuildTemplate", assetFolder = "Furniture"},
+	{frame = Build.Decorations, templateName = "BuildTemplate", assetFolder = "Decorations"},
+	{frame = Build.Construction, templateName = "BuildTemplate", assetFolder = "Construction"},
+}
+
+local function setupViewport(viewportFrame: ViewportFrame, object: Instance)
+	local clone: Instance = object:Clone()
+	clone:PivotTo(CFrame.new(Vector3.zero))
+
+	for _, descendant in clone:GetDescendants() do
+		if descendant:IsA("BasePart") then
+			descendant.Anchored = true
+		end
+	end
+
+	clone.Parent = viewportFrame
+
+	local camera = Instance.new("Camera")
+	camera.Parent = viewportFrame
+	viewportFrame.CurrentCamera = camera
+
+	local cf, size = clone:GetBoundingBox()
+	local maxDim = math.max(size.X, size.Y, size.Z)
+	local distance = maxDim * 1.5
+	camera.CFrame = CFrame.new(cf.Position + Vector3.new(distance, distance * 0.6, distance), cf.Position)
+end
+
+local function createButton(template: TextButton, object: Instance, parent: Frame)
+	local newButton: TextButton = template:Clone()
+	newButton.Name = object.Name
+	newButton.Parent = parent
+
+	local nameLabel: TextLabel? = newButton:FindFirstChild("BuildNameLabel")
+	if nameLabel then
+		nameLabel.Text = object.Name
+	end
+
+	local coinPriceLabel: TextLabel? = newButton:FindFirstChild("CoinPriceLabel")
+	if coinPriceLabel then
+		local coinPrice = object:GetAttribute("CoinPrice")
+		if typeof(coinPrice) == "number" and coinPrice > 0 then
+			coinPriceLabel.Text = tostring(coinPrice)
+			coinPriceLabel.Visible = true
+		else
+			coinPriceLabel.Visible = false
+		end
+	end
+
+	local diamondPriceLabel: TextLabel? = newButton:FindFirstChild("DiamondPriceLabel")
+	if diamondPriceLabel then
+		local diamondPrice = object:GetAttribute("DiamondPrice")
+		if typeof(diamondPrice) == "number" and diamondPrice > 0 then
+			diamondPriceLabel.Text = tostring(diamondPrice)
+			diamondPriceLabel.Visible = true
+		else
+			diamondPriceLabel.Visible = false
+		end
+	end
+
+	local viewportFrame: ViewportFrame? = newButton:FindFirstChild("ViewportFrame")
+	if viewportFrame then
+		if object:GetAttribute("TextOnly") == true then
+			viewportFrame.Visible = false
+		else
+			setupViewport(viewportFrame, object)
+		end
+	end
+
+	return newButton
+end
+
+local function isFloorPlacement(): boolean
+	local preview = PlacingService.GetPreview()
+	if not preview then return false end
+	return preview:GetAttribute("IsFloor") == true
+		or string.find(string.lower(preview.Name), "floor") ~= nil
+end
+
+local isFloorAreaDragging = false
+local floorDragStartCF: CFrame? = nil
+local areaPreviewBox: Part? = nil
+local areaTileLabel: TextLabel? = nil
+local areaTileBillboard: BillboardGui? = nil
+
+local function getOrCreateAreaPreviewBox(): Part
+	if not areaPreviewBox or not areaPreviewBox.Parent then
+		areaPreviewBox = Instance.new("Part")
+		areaPreviewBox.Name = "FloorAreaPreview"
+		areaPreviewBox.Anchored = true
+		areaPreviewBox.CanCollide = false
+		areaPreviewBox.CanQuery = false
+		areaPreviewBox.CanTouch = false
+		areaPreviewBox.Material = Enum.Material.ForceField
+		areaPreviewBox.Color = canPlaceColor
+		areaPreviewBox.Transparency = 0.5
+		areaPreviewBox.Parent = workspace
+
+		areaTileBillboard = Instance.new("BillboardGui")
+		areaTileBillboard.Name = "TileCountLabel"
+		areaTileBillboard.Size = UDim2.new(0, 100, 0, 28)
+		areaTileBillboard.StudsOffset = Vector3.new(0, 3, 0)
+		areaTileBillboard.AlwaysOnTop = true
+		areaTileBillboard.MaxDistance = 300
+		areaTileLabel = Instance.new("TextLabel")
+		areaTileLabel.Size = UDim2.new(1, 0, 1, 0)
+		areaTileLabel.BackgroundTransparency = 0.3
+		areaTileLabel.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
+		areaTileLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+		areaTileLabel.TextScaled = true
+		areaTileLabel.Font = Enum.Font.GothamBold
+		areaTileLabel.Parent = areaTileBillboard
+		areaTileBillboard.Parent = areaPreviewBox
+	end
+	return areaPreviewBox
+end
+
+local function updateAreaPreviewBox(startCF: CFrame, endCF: CFrame, canPlace: boolean?)
+	local box = getOrCreateAreaPreviewBox()
+	local gridUnit = Settings.GridUnit or 1
+
+	local minX, maxX = math.min(startCF.X, endCF.X), math.max(startCF.X, endCF.X)
+	local minZ, maxZ = math.min(startCF.Z, endCF.Z), math.max(startCF.Z, endCF.Z)
+
+	box.Size = Vector3.new((maxX - minX) + gridUnit, 0.2, (maxZ - minZ) + gridUnit)
+	box.CFrame = CFrame.new((minX + maxX) / 2, startCF.Y + 0.15, (minZ + maxZ) / 2)
+
+	-- Color-code based on validity (green for valid, red for invalid)
+	box.Color = (canPlace == false) and cannotPlaceColor or canPlaceColor
+
+	-- Update tile count display
+	local tileCount = math.ceil((maxX - minX) / gridUnit + 1) * math.ceil((maxZ - minZ) / gridUnit + 1)
+	if areaTileLabel then
+		areaTileLabel.Text = string.format("%d tiles", tileCount)
+	end
+end
+
+local function hideAreaPreviewBox()
+	if areaPreviewBox then
+		areaPreviewBox.Parent = nil
+	end
+end
+
+-- Builds one CFrame per grid cell spanning the rectangle between the drag's
+-- start and end points, all sharing the same rotation/height as the start
+-- (floor tiles are already Y-snapped flush to the plot floor by PlacingService).
+local function computeAreaCFrames(startCF: CFrame, endCF: CFrame): {CFrame}
+	local gridUnit = Settings.GridUnit or 1
+	local rotationOnly = startCF - startCF.Position
+
+	local minX, maxX = math.min(startCF.X, endCF.X), math.max(startCF.X, endCF.X)
+	local minZ, maxZ = math.min(startCF.Z, endCF.Z), math.max(startCF.Z, endCF.Z)
+
+	local cframes = {}
+	local x = minX
+	while x <= maxX + 0.01 do
+		local z = minZ
+		while z <= maxZ + 0.01 do
+			table.insert(cframes, CFrame.new(x, startCF.Y, z) * rotationOnly)
+			z += gridUnit
+		end
+		x += gridUnit
+	end
+	return cframes
+end
+
+local function confirmPlacement()
+	local preview: Instance? = PlacingService.GetPreview()
+	if not preview or not currentObjectName then return end
+
+	local CF: CFrame = PlacingService._CF
+	local canPlace: boolean = PlacingService.CanPlace
+	if not canPlace or not CF then return end
+
+	preview:PivotTo(CF)
+	events.Place:FireServer({
+		ObjectName = currentObjectName,
+		CF = CF,
+	})
+
+	if UserInputS:IsKeyDown(Enum.KeyCode.LeftControl) then return end
+
+	previewTrove:Clean()
+	PlacingService.Cancel()
+	previewHighlight.Adornee = nil
+	mobileAccept.Visible = false
+	mobileRotate.Visible = false
+	ContextActionService:UnbindAction(PLACEMENT_GAMEPAD_ACTION)
+	currentObjectName = nil
+end
+
+local function rotatePreview()
+	if not PlacingService.GetPreview() then return end
+	PlacingService.Rotate(Vector3.yAxis)
+end
+
+local function cancelPlacement()
+	if not PlacingService.GetPreview() then return end
+
+	previewTrove:Clean()
+	PlacingService.Cancel()
+	previewHighlight.Adornee = nil
+	mobileAccept.Visible = false
+	mobileRotate.Visible = false
+	ContextActionService:UnbindAction(PLACEMENT_GAMEPAD_ACTION)
+	currentObjectName = nil
+end
+
+local function onGamepadPlacementInput(_, inputState, inputObject: InputObject)
+	if inputState ~= Enum.UserInputState.Begin then return end
+
+	if inputObject.KeyCode == Enum.KeyCode.ButtonA then
+		confirmPlacement()
+	elseif inputObject.KeyCode == Enum.KeyCode.ButtonY then
+		rotatePreview()
+	elseif inputObject.KeyCode == Enum.KeyCode.ButtonB then
+		cancelPlacement()
+	end
+
+	return Enum.ContextActionResult.Sink
+end
+
+local DRAG_ROTATE_THRESHOLD = 6 -- pixels of movement before a press counts as a rotate-drag instead of a tap
+local FLOOR_DRAG_THRESHOLD = 3 -- lower threshold so floor area dragging starts more responsively
+local DRAG_ROTATE_SENSITIVITY = 0.02 -- radians per pixel of horizontal drag
+
+local function getInputScreenPosition(inputObject: InputObject): Vector2
+	return Vector2.new(inputObject.Position.X, inputObject.Position.Y)
+end
+
+local function startPlacing(object: Instance)
+	previewTrove:Clean()
+	currentObjectName = object.Name
+
+	PlacingService.SetPreview(object)
+	previewTrove:Connect(renderedEvent, function(preview: Model, _, canPlace: boolean)
+		previewHighlight.Adornee = preview
+
+		if canPlace then previewHighlight.OutlineColor, previewHighlight.FillColor = canPlaceColor, canPlaceColor
+		else previewHighlight.OutlineColor, previewHighlight.FillColor = cannotPlaceColor, cannotPlaceColor end
+	end)
+
+	-- Mouse click / touch tap confirms placement -- but holding and dragging
+	-- (mouse or touch) free-rotates the preview toward the drag instead,
+	-- matching Bloxburg's hold-to-rotate. A quick tap (little/no movement
+	-- before release) still confirms; a drag never does.
+	local isPressed = false
+	local isDragRotating = false
+	local pressStartPos = Vector2.zero
+	local dragStartYaw = 0
+
+	previewTrove:Connect(UserInputS.InputBegan, function(inputObject: InputObject, gameProcessedEvent: boolean)
+		if gameProcessedEvent then return end
+
+		local rotateY: Enum.KeyCode = Settings.RotateY
+		local cancel: Enum.KeyCode = Settings.Cancel
+
+		if inputObject.UserInputType == Enum.UserInputType.MouseButton1
+			or inputObject.UserInputType == Enum.UserInputType.Touch then
+			isPressed = true
+			isDragRotating = false
+			isFloorAreaDragging = false
+			pressStartPos = getInputScreenPosition(inputObject)
+			dragStartYaw = PlacingService.GetRotationY()
+			floorDragStartCF = PlacingService._CF
+		elseif inputObject.KeyCode == rotateY then
+			rotatePreview()
+		elseif inputObject.KeyCode == cancel then
+			cancelPlacement()
+		end
+	end)
+
+	previewTrove:Connect(UserInputS.InputChanged, function(inputObject: InputObject, gameProcessedEvent: boolean)
+		if not isPressed or gameProcessedEvent then return end
+		if inputObject.UserInputType ~= Enum.UserInputType.MouseMovement
+			and inputObject.UserInputType ~= Enum.UserInputType.Touch then return end
+
+		local currentPos = getInputScreenPosition(inputObject)
+		local delta = currentPos - pressStartPos
+
+		if isFloorPlacement() then
+			-- Floors: dragging paints an area instead of rotating.
+			if not isFloorAreaDragging and delta.Magnitude > FLOOR_DRAG_THRESHOLD then
+				isFloorAreaDragging = true
+			end
+			if isFloorAreaDragging and floorDragStartCF and PlacingService._CF then
+				updateAreaPreviewBox(floorDragStartCF, PlacingService._CF, PlacingService.CanPlace)
+			end
+			return
+		end
+
+		if not isDragRotating and delta.Magnitude > DRAG_ROTATE_THRESHOLD then
+			isDragRotating = true
+			PlacingService.IsDragRotating = true
+		end
+
+		if isDragRotating then
+			PlacingService.SetRotationY(dragStartYaw + (delta.X * DRAG_ROTATE_SENSITIVITY))
+		end
+	end)
+
+	previewTrove:Connect(UserInputS.InputEnded, function(inputObject: InputObject)
+		if not isPressed then return end
+		if inputObject.UserInputType ~= Enum.UserInputType.MouseButton1
+			and inputObject.UserInputType ~= Enum.UserInputType.Touch then return end
+
+		local wasDragRotating = isDragRotating
+		local wasFloorAreaDragging = isFloorAreaDragging
+		isPressed = false
+		isDragRotating = false
+		isFloorAreaDragging = false
+		PlacingService.IsDragRotating = false
+		hideAreaPreviewBox()
+
+		if wasFloorAreaDragging and floorDragStartCF and PlacingService._CF and currentObjectName then
+			local cframes = computeAreaCFrames(floorDragStartCF, PlacingService._CF)
+			events.PlaceArea:FireServer({
+				ObjectName = currentObjectName,
+				CFrames = cframes,
+			})
+			floorDragStartCF = nil
+			return
+		end
+		floorDragStartCF = nil
+
+		if not wasDragRotating then
+			confirmPlacement()
+		end
+	end)
+
+	mobileAccept.Visible = true
+	mobileRotate.Visible = true
+
+	ContextActionService:BindActionAtPriority(
+		PLACEMENT_GAMEPAD_ACTION,
+		onGamepadPlacementInput,
+		false,
+		Enum.ContextActionPriority.High.Value,
+		Enum.KeyCode.ButtonA,
+		Enum.KeyCode.ButtonY,
+		Enum.KeyCode.ButtonB
+	)
+end
+
+mobileAccept.Activated:Connect(confirmPlacement)
+mobileRotate.Activated:Connect(rotatePreview)
+mobileAccept.Visible = false
+mobileRotate.Visible = false
+
+local function setupCategory(category)
+	local frame: ScrollingFrame = category.frame
+	local template: TextButton = frame:FindFirstChild(category.templateName)
+	if not template then return end
+
+	template.Parent = nil
+
+	local assetFolder: Folder? = shared.Assets:FindFirstChild(category.assetFolder)
+	if not assetFolder then return end
+
+	for _, object: Instance in assetFolder:GetChildren() do
+		assert(
+			object:IsA("BasePart") or object:IsA("Model"),
+			`{object} is not a valid object`
+		)
+
+		local newButton = createButton(template, object, frame)
+
+		local buildType = object:GetAttribute("BuildType")
+
+		if buildType == "Door" then
+			local doorStyle = object:GetAttribute("DoorStyle") or "Single"
+			newButton.MouseButton1Click:Connect(function()
+				WallBuildToolManager.setTool("Door", doorStyle)
+			end)
+		elseif buildType == "Window" then
+			local windowStyle = object:GetAttribute("WindowStyle") or "Standard"
+			newButton.MouseButton1Click:Connect(function()
+				WallBuildToolManager.setTool("Window", windowStyle)
+			end)
+		elseif buildType == "Wall" or object.Name == "Wall" then
+			newButton.MouseButton1Click:Connect(function()
+				WallBuildToolManager.setTool("Wall", nil)
+			end)
+		else
+			newButton.MouseButton1Click:Connect(function()
+				startPlacing(object)
+			end)
+		end
+	end
+end
+
+for _, category in categories do
+	setupCategory(category)
+end
+
+-- ===== Category tabs =====
+-- The 4 tab buttons (Furniture/Decorations/Construction/Inventory) and their
+-- content frames existed in the GUI already, but nothing ever switched
+-- between them -- Furniture just happened to be left Visible=true by default
+-- and the other three were permanently hidden with no way to reach them.
+local tabButtons = Build.Buttons
+local tabFrames = {
+	Furniture = Build.Furniture,
+	Decorations = Build.Decorations,
+	Construction = Build.Construction,
+	Inventory = Build.Inventory,
+}
+
+local currentTabName = "Furniture"
+
+local function showTab(tabName: string)
+	if not tabFrames[tabName] then return end
+	currentTabName = tabName
+
+	for name, frame in pairs(tabFrames) do
+		frame.Visible = (name == tabName)
+	end
+
+	for _, button in ipairs(tabButtons:GetChildren()) do
+		if button:IsA("ImageButton") then
+			button.ImageTransparency = (button.Name == tabName) and 0 or 0.4
+		end
+	end
+end
+
+for _, button in ipairs(tabButtons:GetChildren()) do
+	if button:IsA("ImageButton") and tabFrames[button.Name] then
+		button.MouseButton1Click:Connect(function()
+			showTab(button.Name)
+		end)
+	end
+end
+
+showTab("Furniture")
+
+-- ===== Search =====
+-- SearchButton existed with no input field behind it at all. Tapping it now
+-- reveals a text box that live-filters whichever tab is currently open by
+-- item name -- switching tabs while searching clears the filter so it never
+-- looks like a tab is just missing items.
+local searchButton: ImageButton = Build:WaitForChild("SearchButton")
+local searchBar: Frame = Build:WaitForChild("SearchBar")
+local searchTextBox: TextBox = searchBar:WaitForChild("SearchTextBox")
+local searchClearButton: TextButton = searchBar:WaitForChild("ClearButton")
+
+local function applySearchFilter(query: string)
+	local frame = tabFrames[currentTabName]
+	if not frame then return end
+
+	local loweredQuery = string.lower(query)
+
+	for _, child in ipairs(frame:GetChildren()) do
+		if child:IsA("GuiButton") and child.Name ~= "BuildTemplate" and child.Name ~= "InventoryTemplate" then
+			child.Visible = (loweredQuery == "") or (string.find(string.lower(child.Name), loweredQuery, 1, true) ~= nil)
+		end
+	end
+end
+
+searchButton.MouseButton1Click:Connect(function()
+	searchBar.Visible = not searchBar.Visible
+	if searchBar.Visible then
+		searchTextBox:CaptureFocus()
+	else
+		searchTextBox.Text = ""
+		applySearchFilter("")
+	end
+end)
+
+searchTextBox:GetPropertyChangedSignal("Text"):Connect(function()
+	searchClearButton.Visible = searchTextBox.Text ~= ""
+	applySearchFilter(searchTextBox.Text)
+end)
+
+searchClearButton.Activated:Connect(function()
+	searchTextBox.Text = ""
+	searchTextBox:CaptureFocus()
+end)
+
+-- Switching tabs while a search is active would otherwise leave the new tab
+-- silently filtered by whatever was typed for the old one.
+for _, button in ipairs(tabButtons:GetChildren()) do
+	if button:IsA("ImageButton") and tabFrames[button.Name] then
+		button.MouseButton1Click:Connect(function()
+			if searchTextBox.Text ~= "" then
+				searchTextBox.Text = ""
+			end
+		end)
+	end
+end
+
+Build:GetPropertyChangedSignal("Enabled"):Connect(function()
+	if not Build.Enabled then
+		previewTrove:Clean()
+		PlacingService.Cancel()
+		previewHighlight.Adornee = nil
+		mobileAccept.Visible = false
+		mobileRotate.Visible = false
+		ContextActionService:UnbindAction(PLACEMENT_GAMEPAD_ACTION)
+		currentObjectName = nil
+	end
+end)
+
+do
+	local function OnCharacterAdded(char: Model)
+		for _, child: Instance in char:GetChildren() do
+			if not child:IsA("BasePart") then continue end
+
+			child.CollisionGroup = "Player"
+		end
+	end
+
+	player.CharacterAdded:Connect(OnCharacterAdded)
+
+	local char: Model? = player.Character
+	if char then OnCharacterAdded(char) end
+end
