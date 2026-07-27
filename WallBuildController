@@ -9,29 +9,72 @@ local buildGui = playerGui:WaitForChild("Build")
 local toolbar = buildGui:WaitForChild("Toolbar")
 
 local wallButton = toolbar:WaitForChild("Wall")
-local doorButton = toolbar:WaitForChild("Door")
-local windowButton = toolbar:WaitForChild("Window")
 local roofButton = toolbar:WaitForChild("Roof")
+
+-- Wall toolbar button is replaced by the Wall catalog item in Construction
+wallButton.Visible = false
+
+-- Door & Window toolbar buttons are replaced by catalog items in Construction
+local oldDoorBtn = toolbar:FindFirstChild("Door")
+local oldWindowBtn = toolbar:FindFirstChild("Window")
+if oldDoorBtn then oldDoorBtn.Visible = false end
+if oldWindowBtn then oldWindowBtn.Visible = false end
 
 local Modules = ReplicatedStorage:WaitForChild("Modules")
 local General = require(ReplicatedStorage.BuildMode.Utility:WaitForChild("General"))
 local Settings = require(ReplicatedStorage.BuildMode:WaitForChild("Settings"))
 local ActingPlotResolver = require(Modules:WaitForChild("ActingPlotResolver"))
 local WallBuildConfig = require(Modules:WaitForChild("WallBuildConfig"))
+local WallBuildToolManager = require(script.Parent.Modules:WaitForChild("WallBuildToolManager"))
 
 local RemoteEvents = ReplicatedStorage:WaitForChild("RemoteEvents")
 local wallBuildEvent = RemoteEvents:WaitForChild("WallBuildAction")
 
 local currentTool: string? = nil -- "Wall" | "Door" | "Window" | "Roof"
+local currentDoorStyle: string? = nil
+local currentWindowStyle: string? = nil
 local wallStartPos: Vector3? = nil
 local rotation = 0
 local ghostPart: Part? = nil
+local ghostHighlight: Highlight? = nil
+local ghostTargetCF: CFrame? = nil
+local ghostTargetSize: Vector3? = nil
+local ghostVisualCF: CFrame? = nil
+local ghostVisualSize: Vector3? = nil
+local startPointIndicator: Part? = nil
+local lengthBillboard: BillboardGui? = nil
+local lengthLabel: TextLabel? = nil
+local swingArrow: Part? = nil
 
-local toolButtons = { Wall = wallButton, Door = doorButton, Window = windowButton, Roof = roofButton }
+local toolButtons = { 
+	Wall = wallButton, 
+	Roof = roofButton 
+}
+
 local originalColors = {}
 for name, btn in pairs(toolButtons) do
 	originalColors[name] = btn.ImageColor3
 end
+
+-- Forward declaration for local helper
+local setActiveTool
+
+-- Listen for tool changes triggered by Construction catalog item clicks
+WallBuildToolManager.onChange(function(toolName, style)
+	if toolName == "Door" then
+		currentDoorStyle = style
+		setActiveTool("Door")
+	elseif toolName == "Window" then
+		currentWindowStyle = style
+		setActiveTool("Window")
+	elseif toolName == "Wall" then
+		setActiveTool("Wall")
+	else
+		setActiveTool(nil)
+	end
+end)
+
+-- ===== HELPER FUNCTIONS =====
 
 local function getPlot(): Model?
 	return ActingPlotResolver.getActingPlot(player, true)
@@ -46,11 +89,46 @@ local function snapToGrid(pos: Vector3): Vector3
 	)
 end
 
+-- Locks wall along whichever axis the cursor is further along (Bloxburg style axis snap)
+local function snapToAxis(startPos: Vector3, endPos: Vector3): Vector3
+	local deltaX = math.abs(endPos.X - startPos.X)
+	local deltaZ = math.abs(endPos.Z - startPos.Z)
+
+	if deltaX > deltaZ then
+		return Vector3.new(endPos.X, startPos.Y, startPos.Z)
+	else
+		return Vector3.new(startPos.X, startPos.Y, endPos.Z)
+	end
+end
+
+local function isWallPart(part: Instance?): boolean
+	if not part then return false end
+	local buildType = part:GetAttribute("BuildType")
+	return buildType == "Wall" or buildType == "WallSegment"
+end
+
 local function destroyGhost()
 	if ghostPart then
 		ghostPart:Destroy()
 		ghostPart = nil
 	end
+	if ghostHighlight then
+		ghostHighlight:Destroy()
+		ghostHighlight = nil
+	end
+	if lengthBillboard then
+		lengthBillboard:Destroy()
+		lengthBillboard = nil
+		lengthLabel = nil
+	end
+	if swingArrow then
+		swingArrow:Destroy()
+		swingArrow = nil
+	end
+	ghostTargetCF = nil
+	ghostTargetSize = nil
+	ghostVisualCF = nil
+	ghostVisualSize = nil
 end
 
 local function showGhost(size: Vector3, cframe: CFrame, valid: boolean)
@@ -64,56 +142,126 @@ local function showGhost(size: Vector3, cframe: CFrame, valid: boolean)
 		ghostPart.Material = Enum.Material.ForceField
 		ghostPart.Transparency = WallBuildConfig.GhostTransparency
 		ghostPart.Parent = workspace
+
+		ghostVisualCF = cframe
+		ghostVisualSize = size
+		ghostPart.CFrame = cframe
+		ghostPart.Size = size
+
+		ghostHighlight = Instance.new("Highlight")
+		ghostHighlight.FillTransparency = 0.85
+		ghostHighlight.OutlineTransparency = 0
+		ghostHighlight.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+		ghostHighlight.Parent = ghostPart
 	end
-	ghostPart.Size = size
-	ghostPart.CFrame = cframe
-	ghostPart.Color = valid and WallBuildConfig.Colors.GhostValid or WallBuildConfig.Colors.GhostInvalid
+
+	ghostTargetSize = size
+	ghostTargetCF = cframe
+
+	local color = valid and WallBuildConfig.Colors.GhostValid or WallBuildConfig.Colors.GhostInvalid
+	ghostPart.Color = color
+	if ghostHighlight then
+		ghostHighlight.FillColor = color
+		ghostHighlight.OutlineColor = color
+	end
 end
 
-local function setActiveTool(toolName: string?)
+local function showStartPoint(pos: Vector3)
+	if not startPointIndicator then
+		startPointIndicator = Instance.new("Part")
+		startPointIndicator.Name = "WallStartPoint"
+		startPointIndicator.Shape = Enum.PartType.Ball
+		startPointIndicator.Size = Vector3.new(1.5, 1.5, 1.5)
+		startPointIndicator.Anchored = true
+		startPointIndicator.CanCollide = false
+		startPointIndicator.CanQuery = false
+		startPointIndicator.CanTouch = false
+		startPointIndicator.Material = Enum.Material.Neon
+		startPointIndicator.Color = Color3.fromRGB(100, 200, 255)
+		startPointIndicator.Transparency = 0.3
+		startPointIndicator.Parent = workspace
+	end
+	startPointIndicator.Position = pos
+end
+
+local function hideStartPoint()
+	if startPointIndicator then
+		startPointIndicator:Destroy()
+		startPointIndicator = nil
+	end
+end
+
+local function showLengthLabel(length: number)
+	if not lengthBillboard then
+		lengthBillboard = Instance.new("BillboardGui")
+		lengthBillboard.Name = "LengthLabel"
+		lengthBillboard.Size = UDim2.new(0, 120, 0, 30)
+		lengthBillboard.StudsOffset = Vector3.new(0, 3, 0)
+		lengthBillboard.AlwaysOnTop = true
+		lengthBillboard.MaxDistance = 300
+		lengthLabel = Instance.new("TextLabel")
+		lengthLabel.Size = UDim2.new(1, 0, 1, 0)
+		lengthLabel.BackgroundTransparency = 0.3
+		lengthLabel.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
+		lengthLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+		lengthLabel.TextScaled = true
+		lengthLabel.Font = Enum.Font.GothamBold
+		lengthLabel.Parent = lengthBillboard
+		lengthBillboard.Parent = ghostPart
+	end
+	if lengthLabel then
+		lengthLabel.Text = string.format("%.1f studs", length)
+	end
+end
+
+local function hideLengthLabel()
+	if lengthBillboard then
+		lengthBillboard:Destroy()
+		lengthBillboard = nil
+		lengthLabel = nil
+	end
+end
+
+local function showSwingArrow(doorCF: CFrame, swingSign: number)
+	if not swingArrow then
+		swingArrow = Instance.new("Part")
+		swingArrow.Name = "SwingArrow"
+		swingArrow.Size = Vector3.new(0.3, 0.1, 1.5)
+		swingArrow.Anchored = true
+		swingArrow.CanCollide = false
+		swingArrow.CanQuery = false
+		swingArrow.CanTouch = false
+		swingArrow.Material = Enum.Material.Neon
+		swingArrow.Color = Color3.fromRGB(100, 255, 100)
+		swingArrow.Transparency = 0.3
+		swingArrow.Parent = workspace
+	end
+	local doorType = WallBuildConfig.DoorTypes[currentDoorStyle or "Single"]
+	local hingeOffset = CFrame.new(0, 0, swingSign * doorType.width / 2)
+	swingArrow.CFrame = doorCF * hingeOffset * CFrame.Angles(0, math.rad(70 * swingSign), 0)
+end
+
+local function hideSwingArrow()
+	if swingArrow then
+		swingArrow:Destroy()
+		swingArrow = nil
+	end
+end
+
+setActiveTool = function(toolName: string?)
 	currentTool = toolName
 	wallStartPos = nil
 	destroyGhost()
+	hideStartPoint()
+	hideLengthLabel()
+	hideSwingArrow()
 	for name, btn in pairs(toolButtons) do
 		btn.ImageColor3 = (name == toolName) and Color3.fromRGB(100, 200, 255) or originalColors[name]
 	end
 	player:SetAttribute("WallBuildTool", toolName)
 end
 
-for name, btn in pairs(toolButtons) do
-	btn.MouseButton1Click:Connect(function()
-		if currentTool == name then
-			setActiveTool(nil)
-		else
-			setActiveTool(name)
-		end
-	end)
-end
-
--- Exit our tools if another build tool (delete, paint, etc.) takes over
-player:GetAttributeChangedSignal("DeleteMode"):Connect(function()
-	if player:GetAttribute("DeleteMode") and currentTool then
-		setActiveTool(nil)
-	end
-end)
-
-buildGui:GetPropertyChangedSignal("Enabled"):Connect(function()
-	if not buildGui.Enabled then
-		setActiveTool(nil)
-	end
-end)
-
--- ===== GHOST PREVIEW =====
-
-local function getWallCFrame(pos1: Vector3, pos2: Vector3): (CFrame, Vector3)
-	pos2 = Vector3.new(pos2.X, pos1.Y, pos2.Z)
-	local direction = pos2 - pos1
-	local length = Vector3.new(direction.X, 0, direction.Z).Magnitude
-	local angle = math.atan2(direction.X, direction.Z)
-	local midpoint = (pos1 + pos2) / 2
-	midpoint = Vector3.new(midpoint.X, pos1.Y + WallBuildConfig.WallHeight / 2, midpoint.Z)
-	return CFrame.new(midpoint) * CFrame.Angles(0, angle, 0), Vector3.new(WallBuildConfig.WallThickness, WallBuildConfig.WallHeight, length)
-end
+-- ===== RAYCAST PARAMS =====
 
 local function getGroundRaycastParams(plot: Model): RaycastParams
 	local params = RaycastParams.new()
@@ -135,57 +283,110 @@ local function getWallOnlyRaycastParams(plot: Model): RaycastParams
 	return params
 end
 
-local function updateGhost()
+local function getWallCFrame(pos1: Vector3, pos2: Vector3): (CFrame, Vector3)
+	pos2 = Vector3.new(pos2.X, pos1.Y, pos2.Z)
+	local direction = pos2 - pos1
+	local length = Vector3.new(direction.X, 0, direction.Z).Magnitude
+	local angle = math.atan2(direction.X, direction.Z)
+	local midpoint = (pos1 + pos2) / 2
+	midpoint = Vector3.new(midpoint.X, pos1.Y + WallBuildConfig.WallHeight / 2, midpoint.Z)
+	return CFrame.new(midpoint) * CFrame.Angles(0, angle, 0), Vector3.new(WallBuildConfig.WallThickness, WallBuildConfig.WallHeight, length)
+end
+
+-- ===== UI & ATTRIBUTE LISTENERS =====
+
+for name, btn in pairs(toolButtons) do
+	btn.MouseButton1Click:Connect(function()
+		if currentTool == name then
+			setActiveTool(nil)
+		else
+			setActiveTool(name)
+		end
+	end)
+end
+
+player:GetAttributeChangedSignal("DeleteMode"):Connect(function()
+	if player:GetAttribute("DeleteMode") and currentTool then
+		setActiveTool(nil)
+	end
+end)
+
+buildGui:GetPropertyChangedSignal("Enabled"):Connect(function()
+	if not buildGui.Enabled then
+		setActiveTool(nil)
+	end
+end)
+
+-- ===== GHOST PREVIEW =====
+
+local function updateGhost(deltaTime: number)
 	if not currentTool then
 		destroyGhost()
+		hideStartPoint()
+		hideLengthLabel()
+		hideSwingArrow()
 		return
 	end
 
 	local plot = getPlot()
 	if not plot then
 		destroyGhost()
+		hideStartPoint()
+		hideLengthLabel()
+		hideSwingArrow()
 		return
 	end
 
 	if currentTool == "Wall" then
 		local result = General.GetMouseResult(getGroundRaycastParams(plot))
-		if not result then destroyGhost() return end
+		if not result then destroyGhost() hideStartPoint() hideLengthLabel() return end
 		local snapped = snapToGrid(result.Position)
 
 		if wallStartPos then
-			local cframe, size = getWallCFrame(wallStartPos, snapped)
+			local alignedPos = snapToAxis(wallStartPos, snapped)
+			local cframe, size = getWallCFrame(wallStartPos, alignedPos)
 			if size.Z > 0.5 then
 				showGhost(size, cframe, true)
+				showStartPoint(wallStartPos)
+				showLengthLabel(size.Z)
 			else
 				destroyGhost()
+				hideLengthLabel()
 			end
 		else
 			showGhost(Vector3.new(0.5, 0.5, 0.5), CFrame.new(snapped), true)
+			hideStartPoint()
+			hideLengthLabel()
 		end
 
 	elseif currentTool == "Roof" then
 		local result = General.GetMouseResult(getGroundRaycastParams(plot))
-		if not result then destroyGhost() return end
+		if not result then destroyGhost() hideStartPoint() hideLengthLabel() hideSwingArrow() return end
 		local snapped = snapToGrid(result.Position)
 		local size = Vector3.new(WallBuildConfig.TileSize, WallBuildConfig.RoofThickness, WallBuildConfig.TileSize)
 		local cframe = CFrame.new(snapped) * CFrame.Angles(0, math.rad(rotation), 0)
 		showGhost(size, cframe, true)
+		hideStartPoint()
+		hideLengthLabel()
+		hideSwingArrow()
 
 	elseif currentTool == "Door" or currentTool == "Window" then
 		local result = General.GetMouseResult(getWallOnlyRaycastParams(plot))
 		local wallPart = result and result.Instance
-		if wallPart and wallPart:GetAttribute("BuildType") == "Wall" then
+		if isWallPart(wallPart) then
 			local localClick = wallPart.CFrame:ToObjectSpace(CFrame.new(result.Position))
 			local localZ = localClick.Z
 			local height, width, yLocal, thickness
 			if currentTool == "Door" then
-				height, width = WallBuildConfig.DoorHeight, WallBuildConfig.DoorWidth
+				local doorType = WallBuildConfig.DoorTypes[currentDoorStyle or "Single"]
+				height, width = doorType.height, doorType.width
 				yLocal = -WallBuildConfig.WallHeight / 2 + height / 2
-				thickness = WallBuildConfig.DoorThickness
+				thickness = doorType.thickness
 			else
-				height, width = WallBuildConfig.WindowHeight, WallBuildConfig.WindowWidth
-				yLocal = -WallBuildConfig.WallHeight / 2 + WallBuildConfig.WindowSillHeight + height / 2
-				thickness = WallBuildConfig.WindowThickness
+				local windowType = WallBuildConfig.WindowTypes[currentWindowStyle or "Standard"]
+				height, width = windowType.height, windowType.width
+				yLocal = -WallBuildConfig.WallHeight / 2 + windowType.sillHeight + height / 2
+				thickness = windowType.thickness
 			end
 			local size = Vector3.new(thickness, height, width)
 			local cframe = wallPart.CFrame * CFrame.new(0, yLocal, localZ)
@@ -194,15 +395,52 @@ local function updateGhost()
 			local halfWidth = width / 2
 			local fits = (localZ - halfWidth >= -wallLength / 2 + 0.1) and (localZ + halfWidth <= wallLength / 2 - 0.1)
 			showGhost(size, cframe, fits)
+
+			if currentTool == "Door" and fits then
+				local doorType = WallBuildConfig.DoorTypes[currentDoorStyle or "Single"]
+				if doorType.swing then
+					local swingSign = UserInputService:IsKeyDown(Enum.KeyCode.LeftShift) and 1 or -1
+					showSwingArrow(cframe, swingSign)
+				else
+					hideSwingArrow()
+				end
+			else
+				hideSwingArrow()
+			end
 		else
 			destroyGhost()
+			hideSwingArrow()
 		end
+		hideStartPoint()
+		hideLengthLabel()
+	end
+
+	-- Smooth lerp the ghost toward its target (Bloxburg-style smooth preview)
+	if ghostPart and ghostTargetCF and ghostTargetSize then
+		local lerpSpeed = Settings.LerpSpeed or 15
+		local alpha = 1 - math.exp(-lerpSpeed * (deltaTime or 0.016))
+
+		if ghostVisualCF then
+			ghostVisualCF = ghostVisualCF:Lerp(ghostTargetCF, alpha)
+		else
+			ghostVisualCF = ghostTargetCF
+		end
+		if ghostVisualSize then
+			ghostVisualSize = ghostVisualSize:Lerp(ghostTargetSize, alpha)
+		else
+			ghostVisualSize = ghostTargetSize
+		end
+
+		ghostPart.CFrame = ghostVisualCF
+		ghostPart.Size = ghostVisualSize
 	end
 end
 
-RunService.RenderStepped:Connect(updateGhost)
+RunService.RenderStepped:Connect(function(deltaTime)
+	updateGhost(deltaTime)
+end)
 
--- ===== CLICK HANDLING =====
+-- ===== INPUT & CLICK HANDLING =====
 
 local function onClick()
 	if not currentTool then return end
@@ -217,11 +455,12 @@ local function onClick()
 		if not wallStartPos then
 			wallStartPos = snapped
 		else
-			local _, size = getWallCFrame(wallStartPos, snapped)
+			local targetEndPos = snapToAxis(wallStartPos, snapped)
+			local _, size = getWallCFrame(wallStartPos, targetEndPos)
 			if size.Z > 0.5 then
-				wallBuildEvent:FireServer("PlaceWall", { startPos = wallStartPos, endPos = snapped })
+				wallBuildEvent:FireServer("PlaceWall", { startPos = wallStartPos, endPos = targetEndPos })
+				wallStartPos = targetEndPos -- Continue chain
 			end
-			wallStartPos = nil
 		end
 
 	elseif currentTool == "Roof" then
@@ -237,18 +476,23 @@ local function onClick()
 	elseif currentTool == "Door" or currentTool == "Window" then
 		local result = General.GetMouseResult(getWallOnlyRaycastParams(plot))
 		local wallPart = result and result.Instance
-		if wallPart and wallPart:GetAttribute("BuildType") == "Wall" then
-			local width = currentTool == "Door" and WallBuildConfig.DoorWidth or WallBuildConfig.WindowWidth
+		if isWallPart(wallPart) then
+			local width
+			if currentTool == "Door" then
+				local doorType = WallBuildConfig.DoorTypes[currentDoorStyle or "Single"]
+				width = doorType.width
+			else
+				local windowType = WallBuildConfig.WindowTypes[currentWindowStyle or "Standard"]
+				width = windowType.width
+			end
 			local localZ = wallPart.CFrame:ToObjectSpace(CFrame.new(result.Position)).Z
 			local wallLength = wallPart.Size.Z
 			local halfWidth = width / 2
 			if (localZ - halfWidth >= -wallLength / 2 + 0.1) and (localZ + halfWidth <= wallLength / 2 - 0.1) then
 				if currentTool == "Door" then
-					-- Hold Shift to place a double door instead of a single
-					local isDouble = UserInputService:IsKeyDown(Enum.KeyCode.LeftShift) or UserInputService:IsKeyDown(Enum.KeyCode.RightShift)
-					wallBuildEvent:FireServer("PlaceDoor", { wallPart = wallPart, position = result.Position, isDouble = isDouble })
+					wallBuildEvent:FireServer("PlaceDoor", { wallPart = wallPart, position = result.Position, doorStyle = currentDoorStyle or "Single" })
 				else
-					wallBuildEvent:FireServer("PlaceWindow", { wallPart = wallPart, position = result.Position })
+					wallBuildEvent:FireServer("PlaceWindow", { wallPart = wallPart, position = result.Position, windowStyle = currentWindowStyle or "Standard" })
 				end
 			end
 		end
@@ -260,10 +504,11 @@ UserInputService.InputBegan:Connect(function(input, gameProcessed)
 
 	if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
 		onClick()
-	elseif input.UserInputType == Enum.UserInputType.MouseButton2 then
-		-- Right-click cancels an in-progress wall start point
+	elseif input.UserInputType == Enum.UserInputType.MouseButton2 or input.KeyCode == Enum.KeyCode.Escape then
 		if currentTool == "Wall" and wallStartPos then
 			wallStartPos = nil
+		else
+			setActiveTool(nil)
 		end
 	elseif input.KeyCode == Enum.KeyCode.R then
 		rotation = (rotation + 90) % 360
