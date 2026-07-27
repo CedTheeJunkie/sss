@@ -1,0 +1,546 @@
+local RepS = game:GetService("ReplicatedStorage")
+local ServerStorage = game:GetService("ServerStorage")
+local ServerScriptService = game:GetService("ServerScriptService")
+local MarketplaceService = game:GetService("MarketplaceService")
+
+local shared = RepS.BuildMode
+local events = RepS.RemoteEvents
+
+local Validation = require(shared.Modules.Validation)
+local PlotService = require(ServerScriptService.Services.PlotService)
+local cachedModules = require(ServerScriptService.Server.CachedModules)
+local RateLimiter = require(ServerScriptService.Services.RateLimiter)
+
+local REFUND_PERCENTAGE = 0.7
+
+local BOUNDS_MARGIN_STUDS = 4
+local CollectionService = game:GetService("CollectionService")
+
+local function isFloorObject(object: Instance): boolean
+	return object:GetAttribute("IsFloor") == true
+		or string.find(string.lower(object.Name), "floor") ~= nil
+end
+
+local function tagFloorIfNeeded(object: Instance)
+	if not isFloorObject(object) then return end
+	if object:IsA("BasePart") then
+		CollectionService:AddTag(object, "Object_IgnoreCollision")
+	else
+		for _, part in ipairs(object:GetDescendants()) do
+			if part:IsA("BasePart") then
+				CollectionService:AddTag(part, "Object_IgnoreCollision")
+			end
+		end
+	end
+end
+
+local function isWithinPlotBounds(plot: Model, cframe: CFrame): boolean
+	local basePart = plot:FindFirstChild("Base")
+	if not basePart or not basePart:IsA("BasePart") then return true end 
+	-- Base is always physically 128x128 (the world is built to fit max plot size);
+	-- the actual buildable area is gated by the PlotSize attribute, which starts
+	-- at 12 and grows as the player buys upgrades.
+	local plotSize: number = plot:GetAttribute("PlotSize") or 12
+	local halfExtents = Vector3.new(plotSize / 2, basePart.Size.Y / 2, plotSize / 2) + Vector3.new(BOUNDS_MARGIN_STUDS, 1000, BOUNDS_MARGIN_STUDS)
+	local localPos = basePart.CFrame:PointToObjectSpace(cframe.Position)
+
+	return math.abs(localPos.X) <= halfExtents.X
+		and math.abs(localPos.Y) <= halfExtents.Y
+		and math.abs(localPos.Z) <= halfExtents.Z
+end
+
+local nextBuildId: number = 1
+
+local trash = Instance.new("Folder")
+trash.Name = "BuildTrash"
+trash.Parent = ServerStorage
+
+local function sendInventoryUpdate(player: Player)
+	local dataService = cachedModules.Cache.DataService
+	if not dataService then return end
+	local playerData = dataService.getData(player)
+	if not playerData then return end
+	events.InventoryUpdate:FireClient(player, playerData.BuildInventory or {})
+end
+
+events.RequestInventory.OnServerEvent:Connect(function(player: Player)
+	if not RateLimiter.guard(player, "RequestInventory", 10, 5) then return end
+	sendInventoryUpdate(player)
+end)
+-- Drag-to-fill placement (floors covering a large area in one action, instead
+-- of clicking once per tile). Reuses the exact same validation rules as
+-- single placement, just batched: all cells are validated first, the WHOLE
+-- area is charged for once, and only then are objects actually created.
+local MAX_AREA_TILES = 200
+
+events.PlaceArea.OnServerEvent:Connect(function(player: Player, arguments: {[string]: any})
+	if not RateLimiter.guard(player, "PlaceArea", 3, 5) then return end
+
+	local objectName: string = arguments.ObjectName
+	local cframes = arguments.CFrames
+	local fromInventory: boolean = arguments.FromInventory == true
+
+	assert(typeof(objectName) == "string", `"ObjectName" was not specified`)
+	assert(typeof(cframes) == "table", `"CFrames" was not specified`)
+
+	if #cframes == 0 then return end
+	local clientNotify = cachedModules.Cache.ClientNotifyService
+
+	if #cframes > MAX_AREA_TILES then
+		if clientNotify then
+			clientNotify.notify(player, "Decline", "That area is too large \226\128\148 try a smaller drag!")
+		end
+		return
+	end
+
+	local plot: Model? = PlotService.getActingPlot(player, true)
+	if not plot then return end
+
+	local buildObjects: Folder = plot:FindFirstChild("BuildObjects")
+	if not buildObjects then
+		buildObjects = Instance.new("Folder")
+		buildObjects.Name = "BuildObjects"
+		buildObjects.Parent = plot
+	end
+
+	local object: Instance? 
+	for _, folder in shared.Assets:GetChildren() do
+		if folder:IsA("Folder") then
+			object = folder:FindFirstChild(objectName)
+			if object then break end
+		end
+	end
+	if not object then return end
+
+	-- Pass 1: figure out which requested cells are actually valid, without committing anything
+	local validCFrames = {}
+	for _, cf in ipairs(cframes) do
+		if typeof(cf) == "CFrame" and isWithinPlotBounds(plot, cf) then
+			local testObject = object:Clone()
+			testObject:PivotTo(cf)
+			local ok = Validation.HasValidPlacement(testObject, { buildObjects })
+			testObject:Destroy()
+			if ok then
+				table.insert(validCFrames, cf)
+			end
+		end
+	end
+
+	if #validCFrames == 0 then
+		if clientNotify then
+			clientNotify.notify(player, "Decline", "Nothing in that area could be placed!")
+		end
+		return
+	end
+
+	-- Pass 2: check + charge for the WHOLE batch before creating anything
+	local moneyService = cachedModules.Cache.MoneyService
+
+	if fromInventory then
+		local dataService = cachedModules.Cache.DataService
+		if not dataService then return end
+		local playerData = dataService.getData(player)
+		if not playerData then return end
+		playerData.BuildInventory = playerData.BuildInventory or {}
+		local have = playerData.BuildInventory[objectName] or 0
+		if have < #validCFrames then
+			local trimmed = {}
+			for i = 1, math.min(have, #validCFrames) do
+				trimmed[i] = validCFrames[i]
+			end
+			validCFrames = trimmed
+		end
+		if #validCFrames == 0 then return end
+		playerData.BuildInventory[objectName] = have - #validCFrames
+	else
+		local coinPrice: number = object:GetAttribute("CoinPrice") or 0
+		local diamondPrice: number = object:GetAttribute("DiamondPrice") or 0
+		local totalCoinCost = coinPrice * #validCFrames
+		local totalDiamondCost = diamondPrice * #validCFrames
+
+		if totalCoinCost > 0 then
+			if not moneyService or not moneyService.hasEnoughCoins(player, totalCoinCost) then
+				if clientNotify then
+					clientNotify.notify(player, "Decline", "Not enough coins for that whole area!")
+				end
+				return
+			end
+			if not moneyService.removeCoins(player, totalCoinCost) then return end
+		elseif totalDiamondCost > 0 then
+			if not moneyService or not moneyService.hasEnoughDiamonds(player, totalDiamondCost) then
+				if clientNotify then
+					clientNotify.notify(player, "Decline", "Not enough diamonds for that whole area!")
+				end
+				return
+			end
+			if not moneyService.removeDiamonds(player, totalDiamondCost) then return end
+		end
+	end
+
+	-- Pass 3: actually create everything
+	for _, cf in ipairs(validCFrames) do
+		local newObject = object:Clone()
+		newObject:PivotTo(cf)
+		local buildId = nextBuildId
+		nextBuildId += 1
+		newObject:SetAttribute("BuildId", buildId)
+		newObject.Parent = buildObjects
+		tagFloorIfNeeded(newObject)
+
+		events.PlacementResult:FireClient(player, {
+			ObjectId = buildId,
+			ObjectName = objectName,
+			CF = cf,
+		})
+	end
+
+	sendInventoryUpdate(player)
+	PlotService.savePlotState(player)
+end)
+
+events.Place.OnServerEvent:Connect(function(player: Player, arguments: {[string]: any})
+	if not RateLimiter.guard(player, "Place", 10, 5) then return end
+
+	local objectName: string = arguments.ObjectName
+	local CF: CFrame = arguments.CF
+	local fromInventory: boolean = arguments.FromInventory == true
+
+	assert(typeof(objectName) == "string", `"ObjectName" was not specified`)
+	assert(typeof(CF) == "CFrame", `"CF" was not specified`)
+
+	local plot: Model? = PlotService.getActingPlot(player, true)
+	if not plot then
+		warn(`{player.Name} has no assigned plot — cannot place objects`)
+		return
+	end
+
+	if not isWithinPlotBounds(plot, CF) then
+		warn(`{player.Name} attempted to place "{objectName}" outside their plot bounds`)
+		return
+	end
+
+	local buildObjects: Folder = plot:FindFirstChild("BuildObjects")
+	if not buildObjects then
+		buildObjects = Instance.new("Folder")
+		buildObjects.Name = "BuildObjects"
+		buildObjects.Parent = plot
+	end
+
+	local object: Instance? 
+	for _, folder in shared.Assets:GetChildren() do
+		if folder:IsA("Folder") then
+			object = folder:FindFirstChild(objectName)
+			if object then break end
+		end
+	end
+	assert(object, `{objectName} couldn't not found in {shared.Assets}`)
+
+	local moneyService = cachedModules.Cache.MoneyService
+	local newObject: Instance = object:Clone()
+	newObject:PivotTo(CF)
+
+	local hasValidPlacement: boolean = Validation.HasValidPlacement(newObject, { buildObjects })
+	if hasValidPlacement and not isWithinPlotBounds(plot, CF) then
+		hasValidPlacement = false
+	end
+	if not hasValidPlacement then
+		newObject:Destroy()
+		warn(`{objectName} has invalid placement for {player.Name}`)
+		local clientNotify = cachedModules.Cache.ClientNotifyService
+		if clientNotify then
+			clientNotify.notify(player, "Decline", "Can't place that there!")
+		end
+		return
+	end
+
+	if fromInventory then
+		local dataService = cachedModules.Cache.DataService
+		if not dataService then newObject:Destroy() return end
+		local playerData = dataService.getData(player)
+		if not playerData then newObject:Destroy() return end
+		playerData.BuildInventory = playerData.BuildInventory or {}
+		local count = playerData.BuildInventory[objectName] or 0
+		if count <= 0 then
+			newObject:Destroy()
+			warn(`{player.Name} does not have {objectName} in inventory`)
+			return
+		end
+		playerData.BuildInventory[objectName] = count - 1
+	else
+		
+		local coinPrice: number? = object:GetAttribute("CoinPrice")
+		local diamondPrice: number? = object:GetAttribute("DiamondPrice")
+
+		if coinPrice and coinPrice > 0 then
+			if not moneyService or not moneyService.hasEnoughCoins(player, coinPrice) then
+				newObject:Destroy()
+				warn(`{player.Name} does not have enough coins to place {objectName}`)
+				local clientNotify = cachedModules.Cache.ClientNotifyService
+				if clientNotify then
+					clientNotify.notify(player, "Decline", "Not enough coins for that!")
+				end
+				return
+			end
+		elseif diamondPrice and diamondPrice > 0 then
+			if not moneyService or not moneyService.hasEnoughDiamonds(player, diamondPrice) then
+				newObject:Destroy()
+				warn(`{player.Name} does not have enough diamonds to place {objectName}`)
+				local clientNotify = cachedModules.Cache.ClientNotifyService
+				if clientNotify then
+					clientNotify.notify(player, "Decline", "Not enough diamonds for that!")
+				end
+				return
+			end
+		end
+
+		if coinPrice and coinPrice > 0 then
+			if not moneyService.removeCoins(player, coinPrice) then
+				newObject:Destroy()
+				warn(`{player.Name} failed to deduct {coinPrice} coins for {objectName}`)
+				return
+			end
+		elseif diamondPrice and diamondPrice > 0 then
+			if not moneyService.removeDiamonds(player, diamondPrice) then
+				newObject:Destroy()
+				warn(`{player.Name} failed to deduct {diamondPrice} diamonds for {objectName}`)
+				return
+			end
+		end
+	end
+
+	local buildId: number = nextBuildId
+	newObject:SetAttribute("BuildId", buildId)
+	newObject.Parent = buildObjects
+	tagFloorIfNeeded(newObject)
+
+	events.PlacementResult:FireClient(player, {
+		ObjectId = buildId,
+		ObjectName = objectName,
+		CF = CF,
+	})
+	nextBuildId += 1
+	
+	if fromInventory then
+		sendInventoryUpdate(player)
+	end
+
+	PlotService.updatePlot(player, "buildPlaced", {
+		ObjectId = buildId,
+		ObjectName = objectName,
+		CF = CF,
+	})
+
+	local dailyQuestService = cachedModules.Cache.DailyQuestService
+	if dailyQuestService and dailyQuestService.reportProgress then
+		dailyQuestService.reportProgress(player, "PlaceObject", 1)
+	end
+end)
+
+events.DeleteObject.OnServerEvent:Connect(function(player: Player, arguments: {[string]: any})
+	if not RateLimiter.guard(player, "DeleteObject", 20, 5) then return end
+
+	local objectId: number = arguments.ObjectId
+	local reason: string? = arguments.Reason
+
+	local plot: Model? = PlotService.getActingPlot(player, true)
+	if not plot then return end
+
+	local buildObjects: Folder? = plot:FindFirstChild("BuildObjects")
+	if not buildObjects then return end
+
+	for _, object in buildObjects:GetChildren() do
+		if object:GetAttribute("BuildId") == objectId then
+			
+			local refundRate: number = (reason == "undo") and 1.0 or REFUND_PERCENTAGE
+			local coinPrice: number? = object:GetAttribute("CoinPrice")
+			local diamondPrice: number? = object:GetAttribute("DiamondPrice")
+			local moneyService = cachedModules.Cache.MoneyService
+
+			if moneyService then
+				if coinPrice and coinPrice > 0 then
+					moneyService.giveCoins(player, math.floor(coinPrice * refundRate))
+				elseif diamondPrice and diamondPrice > 0 then
+					moneyService.giveDiamonds(player, math.floor(diamondPrice * refundRate))
+				end
+			end
+
+			object.Parent = trash
+			PlotService.savePlotState(player)
+			break
+		end
+	end
+end)
+
+events.RestoreObject.OnServerEvent:Connect(function(player: Player, arguments: {[string]: any})
+	if not RateLimiter.guard(player, "RestoreObject", 20, 5) then return end
+
+	local objectId: number = arguments.ObjectId
+	local reason: string? = arguments.Reason
+
+	local plot: Model? = PlotService.getActingPlot(player, true)
+	if not plot then return end
+
+	local buildObjects: Folder = plot:FindFirstChild("BuildObjects")
+	if not buildObjects then
+		buildObjects = Instance.new("Folder")
+		buildObjects.Name = "BuildObjects"
+		buildObjects.Parent = plot
+	end
+
+	for _, object in trash:GetChildren() do
+		if object:GetAttribute("BuildId") == objectId then
+			local coinPrice: number? = object:GetAttribute("CoinPrice")
+			local diamondPrice: number? = object:GetAttribute("DiamondPrice")
+			local moneyService = cachedModules.Cache.MoneyService
+
+			if moneyService then
+				if reason == "undo" then
+					
+					if coinPrice and coinPrice > 0 then
+						local refundAlreadyGiven = math.floor(coinPrice * REFUND_PERCENTAGE)
+						moneyService.giveCoins(player, coinPrice - refundAlreadyGiven)
+					elseif diamondPrice and diamondPrice > 0 then
+						local refundAlreadyGiven = math.floor(diamondPrice * REFUND_PERCENTAGE)
+						moneyService.giveDiamonds(player, diamondPrice - refundAlreadyGiven)
+					end
+				elseif reason == "redo" then
+					
+					if coinPrice and coinPrice > 0 then
+						if not moneyService.removeCoins(player, coinPrice) then
+							warn(`{player.Name} cannot afford to redo place {object.Name} — needs {coinPrice} coins`)
+							return
+						end
+					elseif diamondPrice and diamondPrice > 0 then
+						if not moneyService.removeDiamonds(player, diamondPrice) then
+							warn(`{player.Name} cannot afford to redo place {object.Name} — needs {diamondPrice} diamonds`)
+							return
+						end
+					end
+				end
+			end
+
+			object.Parent = buildObjects
+			PlotService.savePlotState(player)
+			break
+		end
+	end
+end)
+
+events.StoreObject.OnServerEvent:Connect(function(player: Player, arguments: {[string]: any})
+	if not RateLimiter.guard(player, "StoreObject", 15, 5) then return end
+
+	local objectId: number = arguments.ObjectId
+
+	local plot: Model? = PlotService.getActingPlot(player, true)
+	if not plot then return end
+
+	local buildObjects: Folder? = plot:FindFirstChild("BuildObjects")
+	if not buildObjects then return end
+
+	for _, object in buildObjects:GetChildren() do
+		if object:GetAttribute("BuildId") == objectId then
+			local objectName = object.Name
+
+		
+			local dataService = cachedModules.Cache.DataService
+			if dataService then
+				local playerData = dataService.getData(player)
+				if playerData then
+					playerData.BuildInventory = playerData.BuildInventory or {}
+					playerData.BuildInventory[objectName] = (playerData.BuildInventory[objectName] or 0) + 1
+				end
+			end
+
+	
+			object.Parent = nil
+
+			sendInventoryUpdate(player)
+			PlotService.savePlotState(player)
+			break
+		end
+	end
+end)
+
+local GAMEPASS_ID = 1927950438
+
+events.ToggleCollisions.OnServerEvent:Connect(function(player: Player)
+	if not RateLimiter.guard(player, "ToggleCollisions", 5, 5) then return end
+
+	if GAMEPASS_ID > 0 then
+		local success, owns = pcall(function()
+			return MarketplaceService:UserOwnsGamePassAsync(player.UserId, GAMEPASS_ID)
+		end)
+		if not success or not owns then
+			local clientNotify = cachedModules.Cache.ClientNotifyService
+			if clientNotify then
+				clientNotify.notify(player, "Decline", "You need the Disable Collisions gamepass!")
+			end
+			return
+		end
+	end
+
+	local plot: Model? = PlotService.getActingPlot(player, true)
+	if not plot then return end
+
+	local buildObjects: Folder? = plot:FindFirstChild("BuildObjects")
+	if not buildObjects then return end
+
+	
+	local currentState = plot:GetAttribute("CollisionsDisabled") or false
+	local newState = not currentState
+	plot:SetAttribute("CollisionsDisabled", newState)
+
+	
+	for _, object in buildObjects:GetChildren() do
+		for _, descendant in object:GetDescendants() do
+			if descendant:IsA("BasePart") then
+				descendant.CanCollide = not newState
+			end
+		end
+	end
+
+	
+	events.ToggleCollisions:FireClient(player, newState)
+end)
+
+
+events.MoveObject.OnServerEvent:Connect(function(player: Player, arguments: {[string]: any})
+	if not RateLimiter.guard(player, "MoveObject", 30, 5) then return end
+
+	local objectId: number = arguments.ObjectId
+	local CF: CFrame = arguments.CF
+
+	assert(typeof(CF) == "CFrame", `"CF" was not specified for MoveObject`)
+
+	local plot: Model? = PlotService.getActingPlot(player, true)
+	if not plot then return end
+
+	local buildObjects: Folder? = plot:FindFirstChild("BuildObjects")
+	if not buildObjects then return end
+
+	if not isWithinPlotBounds(plot, CF) then
+		warn(`{player.Name} attempted to move an object outside their plot bounds`)
+		return
+	end
+
+	for _, object in buildObjects:GetChildren() do
+		if object:GetAttribute("BuildId") == objectId then
+			local previousCFrame = object:GetPivot()
+			object:PivotTo(CF)
+
+			local hasValidPlacement = Validation.HasValidPlacement(object, { buildObjects })
+			if not hasValidPlacement then
+				object:PivotTo(previousCFrame)
+				warn(`{player.Name} attempted to move an object into an invalid (colliding) position`)
+				local clientNotify = cachedModules.Cache.ClientNotifyService
+				if clientNotify then
+					clientNotify.notify(player, "Decline", "Can't move it there!")
+				end
+				return
+			end
+
+			PlotService.savePlotState(player)
+			break
+		end
+	end
+end)
