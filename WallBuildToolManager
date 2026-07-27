@@ -1,0 +1,41 @@
+local WallBuildToolManager = {}
+
+type ToolChangedCallback = (toolName: string?, style: string?) -> ()
+
+local currentTool: string? = nil
+local currentStyle: string? = nil
+local listeners: {ToolChangedCallback} = {}
+
+function WallBuildToolManager.setTool(toolName: string?, style: string?)
+	currentTool = toolName
+	currentStyle = style
+
+	-- Iterate through a copy or safely call listeners to prevent mutation issues during execution
+	for _, callback in ipairs(listeners) do
+		if typeof(callback) == "function" then
+			task.spawn(callback, toolName, style)
+		end
+	end
+end
+
+function WallBuildToolManager.getTool(): (string?, string?)
+	return currentTool, currentStyle
+end
+
+function WallBuildToolManager.clearTool()
+	WallBuildToolManager.setTool(nil, nil)
+end
+
+function WallBuildToolManager.onChange(callback: ToolChangedCallback): () -> ()
+	table.insert(listeners, callback)
+
+	-- Returns a cleanup function so you can unsubscribe listeners if needed
+	return function()
+		local index = table.find(listeners, callback)
+		if index then
+			table.remove(listeners, index)
+		end
+	end
+end
+
+return WallBuildToolManager
