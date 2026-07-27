@@ -1,546 +1,576 @@
-local RepS = game:GetService("ReplicatedStorage")
-local ServerStorage = game:GetService("ServerStorage")
-local ServerScriptService = game:GetService("ServerScriptService")
-local MarketplaceService = game:GetService("MarketplaceService")
-
-local shared = RepS.BuildMode
-local events = RepS.RemoteEvents
-
-local Validation = require(shared.Modules.Validation)
-local PlotService = require(ServerScriptService.Services.PlotService)
-local cachedModules = require(ServerScriptService.Server.CachedModules)
-local RateLimiter = require(ServerScriptService.Services.RateLimiter)
-
-local REFUND_PERCENTAGE = 0.7
-
-local BOUNDS_MARGIN_STUDS = 4
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local CollectionService = game:GetService("CollectionService")
+local TweenService = game:GetService("TweenService")
 
-local function isFloorObject(object: Instance): boolean
-	return object:GetAttribute("IsFloor") == true
-		or string.find(string.lower(object.Name), "floor") ~= nil
-end
+local WallBuildConfig = require(ReplicatedStorage.Modules.WallBuildConfig)
+local cachedModules = require(game:GetService("ServerScriptService").Server.CachedModules)
 
-local function tagFloorIfNeeded(object: Instance)
-	if not isFloorObject(object) then return end
-	if object:IsA("BasePart") then
-		CollectionService:AddTag(object, "Object_IgnoreCollision")
-	else
-		for _, part in ipairs(object:GetDescendants()) do
-			if part:IsA("BasePart") then
-				CollectionService:AddTag(part, "Object_IgnoreCollision")
-			end
-		end
-	end
-end
+local remotes = ReplicatedStorage:WaitForChild("RemoteEvents")
+local wallBuildEvent = remotes:WaitForChild("WallBuildAction")
 
-local function isWithinPlotBounds(plot: Model, cframe: CFrame): boolean
-	local basePart = plot:FindFirstChild("Base")
-	if not basePart or not basePart:IsA("BasePart") then return true end 
-	-- Base is always physically 128x128 (the world is built to fit max plot size);
-	-- the actual buildable area is gated by the PlotSize attribute, which starts
-	-- at 12 and grows as the player buys upgrades.
-	local plotSize: number = plot:GetAttribute("PlotSize") or 12
-	local halfExtents = Vector3.new(plotSize / 2, basePart.Size.Y / 2, plotSize / 2) + Vector3.new(BOUNDS_MARGIN_STUDS, 1000, BOUNDS_MARGIN_STUDS)
-	local localPos = basePart.CFrame:PointToObjectSpace(cframe.Position)
+local Service = {}
+local doorRegistry: {[BasePart]: any} = {}
+
+-- ===== PLOT & PERMISSION HELPERS =====
+
+local function isWithinPlotBounds(plot: Model, position: Vector3, marginStuds: number?): boolean
+	local base = plot:FindFirstChild("Base")
+	if not base or not base:IsA("BasePart") then return true end
+
+	-- The Base is the authoritative buildable footprint. PlotSize is optional
+	-- metadata and is not present on the live plots, so using a small fallback
+	-- here silently rejected valid floor and wall placements.
+	local margin = marginStuds or 0
+	local halfExtents = Vector3.new(base.Size.X / 2 + margin, base.Size.Y / 2 + 1000, base.Size.Z / 2 + margin)
+	local localPos = base.CFrame:PointToObjectSpace(position)
 
 	return math.abs(localPos.X) <= halfExtents.X
 		and math.abs(localPos.Y) <= halfExtents.Y
 		and math.abs(localPos.Z) <= halfExtents.Z
 end
 
-local nextBuildId: number = 1
-
-local trash = Instance.new("Folder")
-trash.Name = "BuildTrash"
-trash.Parent = ServerStorage
-
-local function sendInventoryUpdate(player: Player)
-	local dataService = cachedModules.Cache.DataService
-	if not dataService then return end
-	local playerData = dataService.getData(player)
-	if not playerData then return end
-	events.InventoryUpdate:FireClient(player, playerData.BuildInventory or {})
+local function getActingPlot(player: Player): Model?
+	local plotService = cachedModules.Cache.PlotService
+	if plotService then
+		return plotService.getActingPlot(player, true)
+	end
+	return nil
 end
 
-events.RequestInventory.OnServerEvent:Connect(function(player: Player)
-	if not RateLimiter.guard(player, "RequestInventory", 10, 5) then return end
-	sendInventoryUpdate(player)
-end)
--- Drag-to-fill placement (floors covering a large area in one action, instead
--- of clicking once per tile). Reuses the exact same validation rules as
--- single placement, just batched: all cells are validated first, the WHOLE
--- area is charged for once, and only then are objects actually created.
-local MAX_AREA_TILES = 200
-
-events.PlaceArea.OnServerEvent:Connect(function(player: Player, arguments: {[string]: any})
-	if not RateLimiter.guard(player, "PlaceArea", 3, 5) then return end
-
-	local objectName: string = arguments.ObjectName
-	local cframes = arguments.CFrames
-	local fromInventory: boolean = arguments.FromInventory == true
-
-	assert(typeof(objectName) == "string", `"ObjectName" was not specified`)
-	assert(typeof(cframes) == "table", `"CFrames" was not specified`)
-
-	if #cframes == 0 then return end
-	local clientNotify = cachedModules.Cache.ClientNotifyService
-
-	if #cframes > MAX_AREA_TILES then
-		if clientNotify then
-			clientNotify.notify(player, "Decline", "That area is too large \226\128\148 try a smaller drag!")
-		end
-		return
-	end
-
-	local plot: Model? = PlotService.getActingPlot(player, true)
-	if not plot then return end
-
-	local buildObjects: Folder = plot:FindFirstChild("BuildObjects")
+local function getBuildObjects(plot: Model): Folder
+	local buildObjects = plot:FindFirstChild("BuildObjects")
 	if not buildObjects then
 		buildObjects = Instance.new("Folder")
 		buildObjects.Name = "BuildObjects"
 		buildObjects.Parent = plot
 	end
+	return buildObjects
+end
 
-	local object: Instance? 
-	for _, folder in shared.Assets:GetChildren() do
-		if folder:IsA("Folder") then
-			object = folder:FindFirstChild(objectName)
-			if object then break end
-		end
-	end
-	if not object then return end
+local function recordBuild(player: Player, record: {[string]: any}): number?
+	local dataService = cachedModules.Cache.DataService
+	local playerData = dataService and dataService.getData(player)
+	if not playerData then return nil end
 
-	-- Pass 1: figure out which requested cells are actually valid, without committing anything
-	local validCFrames = {}
-	for _, cf in ipairs(cframes) do
-		if typeof(cf) == "CFrame" and isWithinPlotBounds(plot, cf) then
-			local testObject = object:Clone()
-			testObject:PivotTo(cf)
-			local ok = Validation.HasValidPlacement(testObject, { buildObjects })
-			testObject:Destroy()
-			if ok then
-				table.insert(validCFrames, cf)
-			end
-		end
-	end
+	playerData.WallBuildData = playerData.WallBuildData or {}
+	table.insert(playerData.WallBuildData, record)
+	return #playerData.WallBuildData
+end
 
-	if #validCFrames == 0 then
-		if clientNotify then
-			clientNotify.notify(player, "Decline", "Nothing in that area could be placed!")
-		end
-		return
-	end
+-- ===== UTILITY =====
 
-	-- Pass 2: check + charge for the WHOLE batch before creating anything
-	local moneyService = cachedModules.Cache.MoneyService
+local function createPart(name: string, size: Vector3, cframe: CFrame, color: Color3, material: Enum.Material, buildType: string): BasePart
+	local part = Instance.new("Part")
+	part.Name = name
+	part.Size = size
+	part.CFrame = cframe
+	part.Color = color
+	part.Material = material
+	part.Anchored = true
+	part:SetAttribute("BuildType", buildType)
+	return part
+end
 
-	if fromInventory then
-		local dataService = cachedModules.Cache.DataService
-		if not dataService then return end
-		local playerData = dataService.getData(player)
-		if not playerData then return end
-		playerData.BuildInventory = playerData.BuildInventory or {}
-		local have = playerData.BuildInventory[objectName] or 0
-		if have < #validCFrames then
-			local trimmed = {}
-			for i = 1, math.min(have, #validCFrames) do
-				trimmed[i] = validCFrames[i]
-			end
-			validCFrames = trimmed
-		end
-		if #validCFrames == 0 then return end
-		playerData.BuildInventory[objectName] = have - #validCFrames
+local function storeWallInfo(model: Model, cframe: CFrame, size: Vector3)
+	model:SetAttribute("OrigPosX", cframe.Position.X)
+	model:SetAttribute("OrigPosY", cframe.Position.Y)
+	model:SetAttribute("OrigPosZ", cframe.Position.Z)
+	model:SetAttribute("OrigRgtX", cframe.RightVector.X)
+	model:SetAttribute("OrigRgtY", cframe.RightVector.Y)
+	model:SetAttribute("OrigRgtZ", cframe.RightVector.Z)
+	model:SetAttribute("OrigUpX", cframe.UpVector.X)
+	model:SetAttribute("OrigUpY", cframe.UpVector.Y)
+	model:SetAttribute("OrigUpZ", cframe.UpVector.Z)
+	model:SetAttribute("OrigSizeX", size.X)
+	model:SetAttribute("OrigSizeY", size.Y)
+	model:SetAttribute("OrigSizeZ", size.Z)
+end
+
+local function getWallInfo(model: Model): (CFrame, Vector3)
+	local pos = Vector3.new(model:GetAttribute("OrigPosX") or 0, model:GetAttribute("OrigPosY") or 0, model:GetAttribute("OrigPosZ") or 0)
+	local right = Vector3.new(model:GetAttribute("OrigRgtX") or 1, model:GetAttribute("OrigRgtY") or 0, model:GetAttribute("OrigRgtZ") or 0)
+	local up = Vector3.new(model:GetAttribute("OrigUpX") or 0, model:GetAttribute("OrigUpY") or 1, model:GetAttribute("OrigUpZ") or 0)
+	local size = Vector3.new(model:GetAttribute("OrigSizeX") or 0, model:GetAttribute("OrigSizeY") or 0, model:GetAttribute("OrigSizeZ") or 0)
+	return CFrame.fromMatrix(pos, right, up), size
+end
+
+-- ===== DOOR PROXIMITY MECHANICS =====
+
+local function registerDoorLeaf(leaf: BasePart, hingeLocalZ: number)
+	leaf:SetAttribute("HingeLocalZ", hingeLocalZ)
+	leaf:SetAttribute("ClosedCFrameOffset", true)
+	doorRegistry[leaf] = { isOpen = false, closedCFrame = leaf.CFrame }
+	CollectionService:AddTag(leaf, "AutoDoorLeaf")
+end
+
+local function setDoorLeafOpen(leaf: BasePart, open: boolean)
+	local state = doorRegistry[leaf]
+	if not state or state.isOpen == open then return end
+	state.isOpen = open
+
+	local hingeLocalZ = leaf:GetAttribute("HingeLocalZ") or 0
+	local closedCFrame = state.closedCFrame
+	local targetCFrame
+
+	if open then
+		local hingeWorld = closedCFrame * CFrame.new(0, 0, hingeLocalZ)
+		local swingSign = hingeLocalZ > 0 and -1 or 1
+		targetCFrame = hingeWorld * CFrame.Angles(0, math.rad(WallBuildConfig.DoorSwingAngle * swingSign), 0) * CFrame.new(0, 0, -hingeLocalZ)
 	else
-		local coinPrice: number = object:GetAttribute("CoinPrice") or 0
-		local diamondPrice: number = object:GetAttribute("DiamondPrice") or 0
-		local totalCoinCost = coinPrice * #validCFrames
-		local totalDiamondCost = diamondPrice * #validCFrames
+		targetCFrame = closedCFrame
+	end
 
-		if totalCoinCost > 0 then
-			if not moneyService or not moneyService.hasEnoughCoins(player, totalCoinCost) then
-				if clientNotify then
-					clientNotify.notify(player, "Decline", "Not enough coins for that whole area!")
-				end
-				return
+	if state.tween then state.tween:Cancel() end
+	state.tween = TweenService:Create(leaf, TweenInfo.new(WallBuildConfig.DoorSwingTime, Enum.EasingStyle.Sine, Enum.EasingDirection.Out), { CFrame = targetCFrame })
+	state.tween:Play()
+end
+
+local function getAllNearbyPositions(): {Vector3}
+	local positions = {}
+	for _, plr in ipairs(Players:GetPlayers()) do
+		local hrp = plr.Character and plr.Character:FindFirstChild("HumanoidRootPart")
+		if hrp then table.insert(positions, hrp.Position) end
+	end
+
+	for _, folderName in ipairs({"CustomerNPCs", "EmployeeNPCs"}) do
+		local folder = workspace:FindFirstChild(folderName)
+		if folder then
+			for _, npc in ipairs(folder:GetChildren()) do
+				local hrp = npc:FindFirstChild("HumanoidRootPart")
+				if hrp then table.insert(positions, hrp.Position) end
 			end
-			if not moneyService.removeCoins(player, totalCoinCost) then return end
-		elseif totalDiamondCost > 0 then
-			if not moneyService or not moneyService.hasEnoughDiamonds(player, totalDiamondCost) then
-				if clientNotify then
-					clientNotify.notify(player, "Decline", "Not enough diamonds for that whole area!")
-				end
-				return
+		end
+	end
+	return positions
+end
+
+local function doorProximityLoop()
+	while true do
+		task.wait(0.3)
+		local positions = getAllNearbyPositions()
+		for leaf, state in pairs(doorRegistry) do
+			if not leaf.Parent then
+				doorRegistry[leaf] = nil
+				continue
 			end
-			if not moneyService.removeDiamonds(player, totalDiamondCost) then return end
+			local leafPos = state.closedCFrame.Position
+			local near = false
+			for _, pos in ipairs(positions) do
+				if (pos - leafPos).Magnitude <= WallBuildConfig.AutoOpenRange then
+					near = true
+					break
+				end
+			end
+			setDoorLeafOpen(leaf, near)
 		end
 	end
+end
 
-	-- Pass 3: actually create everything
-	for _, cf in ipairs(validCFrames) do
-		local newObject = object:Clone()
-		newObject:PivotTo(cf)
-		local buildId = nextBuildId
-		nextBuildId += 1
-		newObject:SetAttribute("BuildId", buildId)
-		newObject.Parent = buildObjects
-		tagFloorIfNeeded(newObject)
+-- ===== WALL PLACEMENT =====
 
-		events.PlacementResult:FireClient(player, {
-			ObjectId = buildId,
-			ObjectName = objectName,
-			CF = cf,
-		})
+local function placeWall(player: Player, data)
+	local startPos, endPos = data.startPos, data.endPos
+	if typeof(startPos) ~= "Vector3" or typeof(endPos) ~= "Vector3" then return end
+
+	endPos = Vector3.new(endPos.X, startPos.Y, endPos.Z)
+	local direction = endPos - startPos
+	local length = Vector3.new(direction.X, 0, direction.Z).Magnitude
+	if length < 1 then return end
+
+	local plot = getActingPlot(player)
+	if not plot then return end
+	if not isWithinPlotBounds(plot, startPos) or not isWithinPlotBounds(plot, endPos) then return end
+
+	local angle = math.atan2(direction.X, direction.Z)
+	local midpoint = (startPos + endPos) / 2
+	midpoint = Vector3.new(midpoint.X, startPos.Y + WallBuildConfig.WallHeight / 2, midpoint.Z)
+
+	local cframe = CFrame.new(midpoint) * CFrame.Angles(0, angle, 0)
+	local size = Vector3.new(WallBuildConfig.WallThickness, WallBuildConfig.WallHeight, length)
+
+	local model = Instance.new("Model")
+	model.Name = "Wall"
+	model:SetAttribute("BuildType", "WallModel")
+	storeWallInfo(model, cframe, size)
+
+	local wallPart = createPart("Color1", size, cframe, WallBuildConfig.Colors.Wall, WallBuildConfig.Materials.Wall, "Wall")
+	wallPart.Parent = model
+	model.Parent = getBuildObjects(plot)
+
+	local recordIndex = recordBuild(player, { kind = "Wall", startPos = {startPos.X, startPos.Y, startPos.Z}, endPos = {endPos.X, endPos.Y, endPos.Z} })
+	if recordIndex then
+		model:SetAttribute("RecordIndex", recordIndex)
 	end
+end
 
-	sendInventoryUpdate(player)
-	PlotService.savePlotState(player)
-end)
+-- ===== FLOOR / ROOF PLACEMENT =====
 
-events.Place.OnServerEvent:Connect(function(player: Player, arguments: {[string]: any})
-	if not RateLimiter.guard(player, "Place", 10, 5) then return end
+local function placeFloor(player: Player, data)
+	local pos, size, rot = data.pos, data.size, data.rotation or 0
+	if typeof(pos) ~= "Vector3" or typeof(size) ~= "Vector3" then return end
 
-	local objectName: string = arguments.ObjectName
-	local CF: CFrame = arguments.CF
-	local fromInventory: boolean = arguments.FromInventory == true
+	local plot = getActingPlot(player)
+	if not plot then return end
+	if not isWithinPlotBounds(plot, pos) then return end
 
-	assert(typeof(objectName) == "string", `"ObjectName" was not specified`)
-	assert(typeof(CF) == "CFrame", `"CF" was not specified`)
+	local cframe = CFrame.new(pos.X, pos.Y + size.Y / 2, pos.Z) * CFrame.Angles(0, math.rad(rot), 0)
+	local part = createPart("Color1", size, cframe, WallBuildConfig.Colors.Floor, WallBuildConfig.Materials.Floor, "Floor")
+	part:SetAttribute("IsFloor", true)
+	CollectionService:AddTag(part, "Object_IgnoreCollision")
+	part.Parent = getBuildObjects(plot)
 
-	local plot: Model? = PlotService.getActingPlot(player, true)
-	if not plot then
-		warn(`{player.Name} has no assigned plot — cannot place objects`)
-		return
-	end
+	recordBuild(player, { kind = "Floor", pos = {pos.X, pos.Y, pos.Z}, size = {size.X, size.Y, size.Z}, rotation = rot })
+end
 
-	if not isWithinPlotBounds(plot, CF) then
-		warn(`{player.Name} attempted to place "{objectName}" outside their plot bounds`)
-		return
-	end
+local function placeRoof(player: Player, data)
+	local pos, size, rot = data.pos, data.size, data.rotation or 0
+	if typeof(pos) ~= "Vector3" or typeof(size) ~= "Vector3" then return end
 
-	local buildObjects: Folder = plot:FindFirstChild("BuildObjects")
-	if not buildObjects then
-		buildObjects = Instance.new("Folder")
-		buildObjects.Name = "BuildObjects"
-		buildObjects.Parent = plot
-	end
+	local plot = getActingPlot(player)
+	if not plot then return end
+	if not isWithinPlotBounds(plot, pos) then return end
 
-	local object: Instance? 
-	for _, folder in shared.Assets:GetChildren() do
-		if folder:IsA("Folder") then
-			object = folder:FindFirstChild(objectName)
-			if object then break end
+	local cframe = CFrame.new(pos) * CFrame.Angles(0, math.rad(rot), 0)
+	local part = createPart("Color1", size, cframe, WallBuildConfig.Colors.Roof, WallBuildConfig.Materials.Roof, "Roof")
+	part.Parent = getBuildObjects(plot)
+
+	recordBuild(player, { kind = "Roof", pos = {pos.X, pos.Y, pos.Z}, size = {size.X, size.Y, size.Z}, rotation = rot })
+end
+
+-- ===== DOOR PLACEMENT =====
+
+local function placeDoor(player: Player, data)
+	local wallPart: BasePart = data.wallPart
+	local position: Vector3 = data.position
+	local isDouble: boolean = data.isDouble == true
+
+	if not wallPart or not wallPart.Parent then return end
+	local model = wallPart.Parent
+	if not model or model:GetAttribute("BuildType") ~= "WallModel" then return end
+
+	-- Allows placement on primary Wall and existing WallSegments
+	local buildType = wallPart:GetAttribute("BuildType")
+	if buildType ~= "Wall" and buildType ~= "WallSegment" then return end
+
+	local plot
+	if data._restoring then
+		plot = model:FindFirstAncestorOfClass("Model")
+		local plots = workspace:FindFirstChild("Plots")
+		while plot and plots and plot.Parent ~= plots do
+			plot = plot.Parent
 		end
-	end
-	assert(object, `{objectName} couldn't not found in {shared.Assets}`)
-
-	local moneyService = cachedModules.Cache.MoneyService
-	local newObject: Instance = object:Clone()
-	newObject:PivotTo(CF)
-
-	local hasValidPlacement: boolean = Validation.HasValidPlacement(newObject, { buildObjects })
-	if hasValidPlacement and not isWithinPlotBounds(plot, CF) then
-		hasValidPlacement = false
-	end
-	if not hasValidPlacement then
-		newObject:Destroy()
-		warn(`{objectName} has invalid placement for {player.Name}`)
-		local clientNotify = cachedModules.Cache.ClientNotifyService
-		if clientNotify then
-			clientNotify.notify(player, "Decline", "Can't place that there!")
-		end
-		return
-	end
-
-	if fromInventory then
-		local dataService = cachedModules.Cache.DataService
-		if not dataService then newObject:Destroy() return end
-		local playerData = dataService.getData(player)
-		if not playerData then newObject:Destroy() return end
-		playerData.BuildInventory = playerData.BuildInventory or {}
-		local count = playerData.BuildInventory[objectName] or 0
-		if count <= 0 then
-			newObject:Destroy()
-			warn(`{player.Name} does not have {objectName} in inventory`)
-			return
-		end
-		playerData.BuildInventory[objectName] = count - 1
 	else
-		
-		local coinPrice: number? = object:GetAttribute("CoinPrice")
-		local diamondPrice: number? = object:GetAttribute("DiamondPrice")
+		plot = getActingPlot(player)
+		if not plot or not model:IsDescendantOf(plot) then return end
+	end
 
-		if coinPrice and coinPrice > 0 then
-			if not moneyService or not moneyService.hasEnoughCoins(player, coinPrice) then
-				newObject:Destroy()
-				warn(`{player.Name} does not have enough coins to place {objectName}`)
-				local clientNotify = cachedModules.Cache.ClientNotifyService
-				if clientNotify then
-					clientNotify.notify(player, "Decline", "Not enough coins for that!")
-				end
-				return
-			end
-		elseif diamondPrice and diamondPrice > 0 then
-			if not moneyService or not moneyService.hasEnoughDiamonds(player, diamondPrice) then
-				newObject:Destroy()
-				warn(`{player.Name} does not have enough diamonds to place {objectName}`)
-				local clientNotify = cachedModules.Cache.ClientNotifyService
-				if clientNotify then
-					clientNotify.notify(player, "Decline", "Not enough diamonds for that!")
-				end
-				return
-			end
+	local wallCFrame, wallSize = wallPart.CFrame, wallPart.Size
+	local thickness, height, length = wallSize.X, wallSize.Y, wallSize.Z
+	local doorWidth, doorHeight = WallBuildConfig.DoorWidth, WallBuildConfig.DoorHeight
+	if height < doorHeight then return end
+
+	local localZ = wallCFrame:ToObjectSpace(CFrame.new(position)).Z
+	local doorStartZ, doorEndZ = localZ - doorWidth / 2, localZ + doorWidth / 2
+	if doorStartZ < -length / 2 + 0.1 or doorEndZ > length / 2 - 0.1 then return end
+
+	if not model:GetAttribute("OrigSizeZ") then
+		storeWallInfo(model, wallCFrame, wallSize)
+	end
+	wallPart:Destroy()
+
+	local leftLength = doorStartZ + length / 2
+	if leftLength > 0.1 then
+		local leftCFrame = wallCFrame * CFrame.new(0, 0, (-length / 2 + doorStartZ) / 2)
+		createPart("Color1", Vector3.new(thickness, height, leftLength), leftCFrame, WallBuildConfig.Colors.Wall, WallBuildConfig.Materials.Wall, "WallSegment").Parent = model
+	end
+
+	local rightLength = length / 2 - doorEndZ
+	if rightLength > 0.1 then
+		local rightCFrame = wallCFrame * CFrame.new(0, 0, (doorEndZ + length / 2) / 2)
+		createPart("Color1", Vector3.new(thickness, height, rightLength), rightCFrame, WallBuildConfig.Colors.Wall, WallBuildConfig.Materials.Wall, "WallSegment").Parent = model
+	end
+
+	local headerHeight = height - doorHeight
+	if headerHeight > 0.1 then
+		local headerCFrame = wallCFrame * CFrame.new(0, doorHeight / 2, localZ)
+		createPart("Color1", Vector3.new(thickness, headerHeight, doorWidth), headerCFrame, WallBuildConfig.Colors.Wall, WallBuildConfig.Materials.Wall, "WallSegment").Parent = model
+	end
+
+	local doorCenterY = -height / 2 + doorHeight / 2
+	local doorThickness = thickness + 0.15
+
+	if isDouble then
+		local leafWidth = doorWidth / 2
+		local leftCenterZ = localZ - leafWidth / 2
+		local rightCenterZ = localZ + leafWidth / 2
+
+		local leftLeaf = createPart("Door", Vector3.new(doorThickness, doorHeight, leafWidth), wallCFrame * CFrame.new(0, doorCenterY, leftCenterZ), WallBuildConfig.Colors.Door, WallBuildConfig.Materials.Door, "Door")
+		leftLeaf.Parent = model
+		registerDoorLeaf(leftLeaf, -leafWidth / 2)
+
+		local rightLeaf = createPart("Door", Vector3.new(doorThickness, doorHeight, leafWidth), wallCFrame * CFrame.new(0, doorCenterY, rightCenterZ), WallBuildConfig.Colors.Door, WallBuildConfig.Materials.Door, "Door")
+		rightLeaf.Parent = model
+		registerDoorLeaf(rightLeaf, leafWidth / 2)
+	else
+		local doorCFrame = wallCFrame * CFrame.new(0, doorCenterY, localZ)
+		local door = createPart("Door", Vector3.new(doorThickness, doorHeight, doorWidth), doorCFrame, WallBuildConfig.Colors.Door, WallBuildConfig.Materials.Door, "Door")
+		door.Parent = model
+		registerDoorLeaf(door, -doorWidth / 2)
+	end
+
+	if not data._restoring then
+		recordBuild(player, { kind = "Door", wallRecordIndex = model:GetAttribute("RecordIndex"), position = {position.X, position.Y, position.Z}, isDouble = isDouble })
+	end
+end
+
+-- ===== WINDOW PLACEMENT =====
+
+local function placeWindow(player: Player, data)
+	local wallPart: BasePart = data.wallPart
+	local position: Vector3 = data.position
+
+	if not wallPart or not wallPart.Parent then return end
+	local model = wallPart.Parent
+	if not model or model:GetAttribute("BuildType") ~= "WallModel" then return end
+
+	-- Allows placement on primary Wall and existing WallSegments
+	local buildType = wallPart:GetAttribute("BuildType")
+	if buildType ~= "Wall" and buildType ~= "WallSegment" then return end
+
+	local plot
+	if data._restoring then
+		plot = model:FindFirstAncestorOfClass("Model")
+		local plots = workspace:FindFirstChild("Plots")
+		while plot and plots and plot.Parent ~= plots do
+			plot = plot.Parent
 		end
+	else
+		plot = getActingPlot(player)
+		if not plot or not model:IsDescendantOf(plot) then return end
+	end
 
-		if coinPrice and coinPrice > 0 then
-			if not moneyService.removeCoins(player, coinPrice) then
-				newObject:Destroy()
-				warn(`{player.Name} failed to deduct {coinPrice} coins for {objectName}`)
-				return
-			end
-		elseif diamondPrice and diamondPrice > 0 then
-			if not moneyService.removeDiamonds(player, diamondPrice) then
-				newObject:Destroy()
-				warn(`{player.Name} failed to deduct {diamondPrice} diamonds for {objectName}`)
-				return
-			end
+	local wallCFrame, wallSize = wallPart.CFrame, wallPart.Size
+	local thickness, height, length = wallSize.X, wallSize.Y, wallSize.Z
+	local windowWidth, windowHeight, sillHeight = WallBuildConfig.WindowWidth, WallBuildConfig.WindowHeight, WallBuildConfig.WindowSillHeight
+	if height < (sillHeight + windowHeight) then return end
+
+	local localZ = wallCFrame:ToObjectSpace(CFrame.new(position)).Z
+	local winStartZ, winEndZ = localZ - windowWidth / 2, localZ + windowWidth / 2
+	if winStartZ < -length / 2 + 0.1 or winEndZ > length / 2 - 0.1 then return end
+
+	if not model:GetAttribute("OrigSizeZ") then
+		storeWallInfo(model, wallCFrame, wallSize)
+	end
+	wallPart:Destroy()
+
+	local windowBottom = -height / 2 + sillHeight
+	local windowTop = windowBottom + windowHeight
+
+	local leftLength = winStartZ + length / 2
+	if leftLength > 0.1 then
+		local leftCFrame = wallCFrame * CFrame.new(0, 0, (-length / 2 + winStartZ) / 2)
+		createPart("Color1", Vector3.new(thickness, height, leftLength), leftCFrame, WallBuildConfig.Colors.Wall, WallBuildConfig.Materials.Wall, "WallSegment").Parent = model
+	end
+
+	local rightLength = length / 2 - winEndZ
+	if rightLength > 0.1 then
+		local rightCFrame = wallCFrame * CFrame.new(0, 0, (winEndZ + length / 2) / 2)
+		createPart("Color1", Vector3.new(thickness, height, rightLength), rightCFrame, WallBuildConfig.Colors.Wall, WallBuildConfig.Materials.Wall, "WallSegment").Parent = model
+	end
+
+	if sillHeight > 0.1 then
+		local sillCFrame = wallCFrame * CFrame.new(0, -height / 2 + sillHeight / 2, localZ)
+		createPart("Color1", Vector3.new(thickness, sillHeight, windowWidth), sillCFrame, WallBuildConfig.Colors.Wall, WallBuildConfig.Materials.Wall, "WallSegment").Parent = model
+	end
+
+	local aboveHeight = height / 2 - windowTop
+	if aboveHeight > 0.1 then
+		local aboveCFrame = wallCFrame * CFrame.new(0, (windowTop + height / 2) / 2, localZ)
+		createPart("Color1", Vector3.new(thickness, aboveHeight, windowWidth), aboveCFrame, WallBuildConfig.Colors.Wall, WallBuildConfig.Materials.Wall, "WallSegment").Parent = model
+	end
+
+	local windowCFrame = wallCFrame * CFrame.new(0, windowBottom + windowHeight / 2, localZ)
+	local window = createPart("Window", Vector3.new(thickness + 0.15, windowHeight, windowWidth), windowCFrame, WallBuildConfig.Colors.Window, WallBuildConfig.Materials.Window, "Window")
+	window.Transparency = 0.3
+	window.Parent = model
+
+	if not data._restoring then
+		recordBuild(player, { kind = "Window", wallRecordIndex = model:GetAttribute("RecordIndex"), position = {position.X, position.Y, position.Z} })
+	end
+end
+
+-- ===== DELETE & STITCH =====
+
+local function stitchWall(model: Model)
+	local origCFrame, origSize = getWallInfo(model)
+	if origSize.Z < 0.1 then return end
+
+	for _, child in ipairs(model:GetChildren()) do
+		if child:IsA("BasePart") then
+			doorRegistry[child] = nil
+			child:Destroy()
 		end
 	end
 
-	local buildId: number = nextBuildId
-	newObject:SetAttribute("BuildId", buildId)
-	newObject.Parent = buildObjects
-	tagFloorIfNeeded(newObject)
+	createPart("Color1", origSize, origCFrame, WallBuildConfig.Colors.Wall, WallBuildConfig.Materials.Wall, "Wall").Parent = model
+end
 
-	events.PlacementResult:FireClient(player, {
-		ObjectId = buildId,
-		ObjectName = objectName,
-		CF = CF,
+local function deleteBuild(player: Player, data)
+	local part: BasePart = data.part
+	if not part or not part.Parent then return end
+
+	local plot = getActingPlot(player)
+	if not plot or not part:IsDescendantOf(plot) then return end
+
+	local buildType = part:GetAttribute("BuildType")
+	if not buildType then return end
+
+	local model = part.Parent
+
+	if buildType == "Wall" then
+		if model:IsA("Model") and model:GetAttribute("BuildType") == "WallModel" then
+			model:Destroy()
+		else
+			part:Destroy()
+		end
+	elseif buildType == "Door" or buildType == "Window" or buildType == "WallSegment" then
+		if model:IsA("Model") and model:GetAttribute("BuildType") == "WallModel" then
+			stitchWall(model)
+		else
+			part:Destroy()
+		end
+	elseif buildType == "Floor" or buildType == "Roof" then
+		part:Destroy()
+	end
+end
+
+-- ===== RECONSTRUCTION / DATA RESTORE =====
+
+local function reconstructWall(plot: Model, record): Model?
+	local startPos = Vector3.new(record.startPos[1], record.startPos[2], record.startPos[3])
+	local endPos = Vector3.new(record.endPos[1], record.endPos[2], record.endPos[3])
+	local direction = endPos - startPos
+	local length = Vector3.new(direction.X, 0, direction.Z).Magnitude
+	if length < 1 then return nil end
+
+	local angle = math.atan2(direction.X, direction.Z)
+	local midpoint = (startPos + endPos) / 2
+	midpoint = Vector3.new(midpoint.X, startPos.Y + WallBuildConfig.WallHeight / 2, midpoint.Z)
+	local cframe = CFrame.new(midpoint) * CFrame.Angles(0, angle, 0)
+	local size = Vector3.new(WallBuildConfig.WallThickness, WallBuildConfig.WallHeight, length)
+
+	local model = Instance.new("Model")
+	model.Name = "Wall"
+	model:SetAttribute("BuildType", "WallModel")
+	storeWallInfo(model, cframe, size)
+
+	createPart("Color1", size, cframe, WallBuildConfig.Colors.Wall, WallBuildConfig.Materials.Wall, "Wall").Parent = model
+	model.Parent = getBuildObjects(plot)
+	return model
+end
+
+local function reconstructFloor(plot: Model, record)
+	local pos = Vector3.new(record.pos[1], record.pos[2], record.pos[3])
+	local size = Vector3.new(record.size[1], record.size[2], record.size[3])
+	local cframe = CFrame.new(pos.X, pos.Y + size.Y / 2, pos.Z) * CFrame.Angles(0, math.rad(record.rotation or 0), 0)
+	local part = createPart("Color1", size, cframe, WallBuildConfig.Colors.Floor, WallBuildConfig.Materials.Floor, "Floor")
+	part:SetAttribute("IsFloor", true)
+	CollectionService:AddTag(part, "Object_IgnoreCollision")
+	part.Parent = getBuildObjects(plot)
+end
+
+local function reconstructRoof(plot: Model, record)
+	local pos = Vector3.new(record.pos[1], record.pos[2], record.pos[3])
+	local size = Vector3.new(record.size[1], record.size[2], record.size[3])
+	local cframe = CFrame.new(pos) * CFrame.Angles(0, math.rad(record.rotation or 0), 0)
+	createPart("Color1", size, cframe, WallBuildConfig.Colors.Roof, WallBuildConfig.Materials.Roof, "Roof").Parent = getBuildObjects(plot)
+end
+
+local function findWallPart(model: Model): BasePart?
+	for _, child in ipairs(model:GetChildren()) do
+		if child:IsA("BasePart") and (child:GetAttribute("BuildType") == "Wall" or child:GetAttribute("BuildType") == "WallSegment") then
+			return child
+		end
+	end
+	return nil
+end
+
+local function reconstructDoor(model: Model, record)
+	local wallPart = findWallPart(model)
+	if not wallPart then return end
+	placeDoor(nil :: any, {
+		wallPart = wallPart,
+		position = Vector3.new(record.position[1], record.position[2], record.position[3]),
+		isDouble = record.isDouble,
+		_restoring = true,
 	})
-	nextBuildId += 1
-	
-	if fromInventory then
-		sendInventoryUpdate(player)
-	end
+end
 
-	PlotService.updatePlot(player, "buildPlaced", {
-		ObjectId = buildId,
-		ObjectName = objectName,
-		CF = CF,
+local function reconstructWindow(model: Model, record)
+	local wallPart = findWallPart(model)
+	if not wallPart then return end
+	placeWindow(nil :: any, {
+		wallPart = wallPart,
+		position = Vector3.new(record.position[1], record.position[2], record.position[3]),
+		_restoring = true,
 	})
+end
 
-	local dailyQuestService = cachedModules.Cache.DailyQuestService
-	if dailyQuestService and dailyQuestService.reportProgress then
-		dailyQuestService.reportProgress(player, "PlaceObject", 1)
-	end
-end)
+function Service.restoreWallBuilds(player: Player, plot: Model)
+	local dataService = cachedModules.Cache.DataService
+	local playerData = dataService and dataService.getData(player)
+	if not playerData or not playerData.WallBuildData then return end
 
-events.DeleteObject.OnServerEvent:Connect(function(player: Player, arguments: {[string]: any})
-	if not RateLimiter.guard(player, "DeleteObject", 20, 5) then return end
+	local wallModelsByIndex: {[number]: Model} = {}
 
-	local objectId: number = arguments.ObjectId
-	local reason: string? = arguments.Reason
-
-	local plot: Model? = PlotService.getActingPlot(player, true)
-	if not plot then return end
-
-	local buildObjects: Folder? = plot:FindFirstChild("BuildObjects")
-	if not buildObjects then return end
-
-	for _, object in buildObjects:GetChildren() do
-		if object:GetAttribute("BuildId") == objectId then
-			
-			local refundRate: number = (reason == "undo") and 1.0 or REFUND_PERCENTAGE
-			local coinPrice: number? = object:GetAttribute("CoinPrice")
-			local diamondPrice: number? = object:GetAttribute("DiamondPrice")
-			local moneyService = cachedModules.Cache.MoneyService
-
-			if moneyService then
-				if coinPrice and coinPrice > 0 then
-					moneyService.giveCoins(player, math.floor(coinPrice * refundRate))
-				elseif diamondPrice and diamondPrice > 0 then
-					moneyService.giveDiamonds(player, math.floor(diamondPrice * refundRate))
-				end
+	for i, record in ipairs(playerData.WallBuildData) do
+		if record.kind == "Wall" then
+			local model = reconstructWall(plot, record)
+			if model then
+				model:SetAttribute("RecordIndex", i)
+				wallModelsByIndex[i] = model
 			end
-
-			object.Parent = trash
-			PlotService.savePlotState(player)
-			break
+		elseif record.kind == "Floor" then
+			reconstructFloor(plot, record)
+		elseif record.kind == "Roof" then
+			reconstructRoof(plot, record)
+		elseif record.kind == "Door" and record.wallRecordIndex then
+			local model = wallModelsByIndex[record.wallRecordIndex]
+			if model then reconstructDoor(model, record) end
+		elseif record.kind == "Window" and record.wallRecordIndex then
+			local model = wallModelsByIndex[record.wallRecordIndex]
+			if model then reconstructWindow(model, record) end
 		end
 	end
-end)
+end
 
-events.RestoreObject.OnServerEvent:Connect(function(player: Player, arguments: {[string]: any})
-	if not RateLimiter.guard(player, "RestoreObject", 20, 5) then return end
+-- ===== INITIALIZATION =====
 
-	local objectId: number = arguments.ObjectId
-	local reason: string? = arguments.Reason
+function Service.init()
+	wallBuildEvent.OnServerEvent:Connect(function(player: Player, action: string, data: any)
+		data = data or {}
+		local rateLimiter = cachedModules.Cache.RateLimiter
+		if rateLimiter and not rateLimiter.guard(player, "WallBuildAction", 15, 5) then return end
 
-	local plot: Model? = PlotService.getActingPlot(player, true)
-	if not plot then return end
-
-	local buildObjects: Folder = plot:FindFirstChild("BuildObjects")
-	if not buildObjects then
-		buildObjects = Instance.new("Folder")
-		buildObjects.Name = "BuildObjects"
-		buildObjects.Parent = plot
-	end
-
-	for _, object in trash:GetChildren() do
-		if object:GetAttribute("BuildId") == objectId then
-			local coinPrice: number? = object:GetAttribute("CoinPrice")
-			local diamondPrice: number? = object:GetAttribute("DiamondPrice")
-			local moneyService = cachedModules.Cache.MoneyService
-
-			if moneyService then
-				if reason == "undo" then
-					
-					if coinPrice and coinPrice > 0 then
-						local refundAlreadyGiven = math.floor(coinPrice * REFUND_PERCENTAGE)
-						moneyService.giveCoins(player, coinPrice - refundAlreadyGiven)
-					elseif diamondPrice and diamondPrice > 0 then
-						local refundAlreadyGiven = math.floor(diamondPrice * REFUND_PERCENTAGE)
-						moneyService.giveDiamonds(player, diamondPrice - refundAlreadyGiven)
-					end
-				elseif reason == "redo" then
-					
-					if coinPrice and coinPrice > 0 then
-						if not moneyService.removeCoins(player, coinPrice) then
-							warn(`{player.Name} cannot afford to redo place {object.Name} — needs {coinPrice} coins`)
-							return
-						end
-					elseif diamondPrice and diamondPrice > 0 then
-						if not moneyService.removeDiamonds(player, diamondPrice) then
-							warn(`{player.Name} cannot afford to redo place {object.Name} — needs {diamondPrice} diamonds`)
-							return
-						end
-					end
-				end
-			end
-
-			object.Parent = buildObjects
-			PlotService.savePlotState(player)
-			break
+		if action == "PlaceWall" then
+			placeWall(player, data)
+		elseif action == "PlaceFloor" then
+			placeFloor(player, data)
+		elseif action == "PlaceRoof" then
+			placeRoof(player, data)
+		elseif action == "PlaceDoor" then
+			placeDoor(player, data)
+		elseif action == "PlaceWindow" then
+			placeWindow(player, data)
+		elseif action == "Delete" then
+			deleteBuild(player, data)
 		end
-	end
-end)
+	end)
 
-events.StoreObject.OnServerEvent:Connect(function(player: Player, arguments: {[string]: any})
-	if not RateLimiter.guard(player, "StoreObject", 15, 5) then return end
+	task.spawn(doorProximityLoop)
+end
 
-	local objectId: number = arguments.ObjectId
+Service.init()
 
-	local plot: Model? = PlotService.getActingPlot(player, true)
-	if not plot then return end
-
-	local buildObjects: Folder? = plot:FindFirstChild("BuildObjects")
-	if not buildObjects then return end
-
-	for _, object in buildObjects:GetChildren() do
-		if object:GetAttribute("BuildId") == objectId then
-			local objectName = object.Name
-
-		
-			local dataService = cachedModules.Cache.DataService
-			if dataService then
-				local playerData = dataService.getData(player)
-				if playerData then
-					playerData.BuildInventory = playerData.BuildInventory or {}
-					playerData.BuildInventory[objectName] = (playerData.BuildInventory[objectName] or 0) + 1
-				end
-			end
-
-	
-			object.Parent = nil
-
-			sendInventoryUpdate(player)
-			PlotService.savePlotState(player)
-			break
-		end
-	end
-end)
-
-local GAMEPASS_ID = 1927950438
-
-events.ToggleCollisions.OnServerEvent:Connect(function(player: Player)
-	if not RateLimiter.guard(player, "ToggleCollisions", 5, 5) then return end
-
-	if GAMEPASS_ID > 0 then
-		local success, owns = pcall(function()
-			return MarketplaceService:UserOwnsGamePassAsync(player.UserId, GAMEPASS_ID)
-		end)
-		if not success or not owns then
-			local clientNotify = cachedModules.Cache.ClientNotifyService
-			if clientNotify then
-				clientNotify.notify(player, "Decline", "You need the Disable Collisions gamepass!")
-			end
-			return
-		end
-	end
-
-	local plot: Model? = PlotService.getActingPlot(player, true)
-	if not plot then return end
-
-	local buildObjects: Folder? = plot:FindFirstChild("BuildObjects")
-	if not buildObjects then return end
-
-	
-	local currentState = plot:GetAttribute("CollisionsDisabled") or false
-	local newState = not currentState
-	plot:SetAttribute("CollisionsDisabled", newState)
-
-	
-	for _, object in buildObjects:GetChildren() do
-		for _, descendant in object:GetDescendants() do
-			if descendant:IsA("BasePart") then
-				descendant.CanCollide = not newState
-			end
-		end
-	end
-
-	
-	events.ToggleCollisions:FireClient(player, newState)
-end)
-
-
-events.MoveObject.OnServerEvent:Connect(function(player: Player, arguments: {[string]: any})
-	if not RateLimiter.guard(player, "MoveObject", 30, 5) then return end
-
-	local objectId: number = arguments.ObjectId
-	local CF: CFrame = arguments.CF
-
-	assert(typeof(CF) == "CFrame", `"CF" was not specified for MoveObject`)
-
-	local plot: Model? = PlotService.getActingPlot(player, true)
-	if not plot then return end
-
-	local buildObjects: Folder? = plot:FindFirstChild("BuildObjects")
-	if not buildObjects then return end
-
-	if not isWithinPlotBounds(plot, CF) then
-		warn(`{player.Name} attempted to move an object outside their plot bounds`)
-		return
-	end
-
-	for _, object in buildObjects:GetChildren() do
-		if object:GetAttribute("BuildId") == objectId then
-			local previousCFrame = object:GetPivot()
-			object:PivotTo(CF)
-
-			local hasValidPlacement = Validation.HasValidPlacement(object, { buildObjects })
-			if not hasValidPlacement then
-				object:PivotTo(previousCFrame)
-				warn(`{player.Name} attempted to move an object into an invalid (colliding) position`)
-				local clientNotify = cachedModules.Cache.ClientNotifyService
-				if clientNotify then
-					clientNotify.notify(player, "Decline", "Can't move it there!")
-				end
-				return
-			end
-
-			PlotService.savePlotState(player)
-			break
-		end
-	end
-end)
+return Service
