@@ -1,0 +1,554 @@
+local UserInputService = game:GetService("UserInputService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local CollectionService = game:GetService("CollectionService")
+local Players = game:GetService("Players")
+local ContextActionService = game:GetService("ContextActionService")
+
+local player = Players.LocalPlayer
+local playerGui = player:WaitForChild("PlayerGui")
+local camera = workspace.CurrentCamera
+
+local modules = script.Parent:WaitForChild("Modules")
+local PlacingService = require(modules:WaitForChild("PlacingService"))
+local Settings = require(ReplicatedStorage.BuildMode:WaitForChild("Settings"))
+local Trove = require(ReplicatedStorage.Libraries:WaitForChild("Trove"))
+local BuildHistory = require(ReplicatedStorage.BuildMode:WaitForChild("Modules"):WaitForChild("BuildHistory"))
+
+local events = ReplicatedStorage:WaitForChild("RemoteEvents")
+local deleteEvent = events:FindFirstChild("DeleteObject")
+local cycleRackCategoryRemote = ReplicatedStorage:WaitForChild("RemoteEvents"):WaitForChild("CycleRackCategory")
+local storeEvent = events:FindFirstChild("StoreObject")
+local moveEvent = events:FindFirstChild("MoveObject")
+local placeEvent = events:FindFirstChild("Place")
+local inventoryUpdateEvent = events:FindFirstChild("InventoryUpdate")
+local requestInventoryEvent = events:FindFirstChild("RequestInventory")
+
+local bbguiTemplate = ReplicatedStorage:WaitForChild("BBGUIs"):FindFirstChild("InteractionBB")
+local buildGui = playerGui:WaitForChild("Build")
+local paintGui = playerGui:WaitForChild("Paint")
+local buildAssets = ReplicatedStorage.BuildMode:WaitForChild("Assets")
+local CategoryIconConfig = require(ReplicatedStorage:WaitForChild("Modules"):WaitForChild("CategoryIconConfig"))
+
+
+local selectedObject = nil
+local activeBBGUI = nil
+local isMoving = false
+local moveTrove = nil
+local moveHighlight = nil
+local currentInventory = {}
+
+local ActingPlotResolver = require(game:GetService("ReplicatedStorage").Modules.ActingPlotResolver)
+
+local function getPlot()
+	return ActingPlotResolver.getActingPlot(player, true)
+end
+
+local function findAssetByName(name)
+	for _, folder in buildAssets:GetChildren() do
+		if folder:IsA("Folder") then
+			local asset = folder:FindFirstChild(name)
+			if asset then return asset end
+		end
+	end
+	return nil
+end
+
+local function getAdornee(object)
+	if object:IsA("BasePart") then return object end
+	if object:IsA("Model") then
+		if object.PrimaryPart then return object.PrimaryPart end
+		for _, child in object:GetChildren() do
+			if child:IsA("BasePart") then return child end
+		end
+	end
+	return nil
+end
+
+local function collectPartStates(object)
+	local states = {}
+	if object:IsA("BasePart") then
+		table.insert(states, {part = object, transparency = object.Transparency, canQuery = object.CanQuery})
+	elseif object:IsA("Model") then
+		for _, descendant in object:GetDescendants() do
+			if descendant:IsA("BasePart") then
+				table.insert(states, {part = descendant, transparency = descendant.Transparency, canQuery = descendant.CanQuery})
+			end
+		end
+	end
+	return states
+end
+
+local function setRackVisualsHidden(rack, hidden)
+	local interactionPart = rack:FindFirstChild("InteractionPart", true)
+	if not interactionPart then return end
+
+	local outofstockPart = interactionPart:FindFirstChild("OutofstockPart")
+	if outofstockPart and outofstockPart:IsA("BasePart") then
+		outofstockPart.Transparency = hidden and 1 or 0
+	end
+end
+
+local function restorePartStates(states)
+	for _, state in states do
+		state.part.Transparency = state.transparency
+		state.part.CanQuery = state.canQuery
+	end
+end
+
+
+local startMove  
+local cancelMove = nil 
+
+local function removeBBGUI()
+	if activeBBGUI then
+		activeBBGUI:Destroy()
+		activeBBGUI = nil
+	end
+	selectedObject = nil
+end
+
+local function showBBGUI(object)
+	removeBBGUI()
+	selectedObject = object
+
+	local clone = bbguiTemplate:Clone()
+	clone.Enabled = true
+	clone.Active = true 
+
+	-- Prefer the same InteractionPart attachment Stock/Mutation/Category use,
+	-- so all four billboards share one consistent reference point instead of
+	-- InteractionBB drifting relative to PrimaryPart. Sits at the attachment's
+	-- own height (the "middle"), with Stock/Mutation/Category stacked above it.
+	local interactionPart = object:FindFirstChild("InteractionPart", true)
+	local adornee = interactionPart or getAdornee(object)
+	clone.Adornee = adornee
+	clone.StudsOffset = interactionPart and Vector3.new(0, 0, 0) or clone.StudsOffset
+	clone.Parent = playerGui
+
+	local mainBg = clone:FindFirstChild("MainBackground")
+	local moveBB = mainBg and mainBg:FindFirstChild("MoveBB")
+	local sellBB = mainBg and mainBg:FindFirstChild("SellBB")
+	local storeBB = mainBg and mainBg:FindFirstChild("StoreBB")
+	local cancelBB = mainBg and mainBg:FindFirstChild("CancelBB")
+
+	local function prepButton(btn)
+		if btn then 
+			btn.Active = true 
+		else
+			warn("Warning: One of the interaction buttons is missing from the template structure!")
+		end
+	end
+	prepButton(moveBB)
+	prepButton(sellBB)
+	prepButton(storeBB)
+	prepButton(cancelBB)
+
+	-- Structural items (walls, floors, roofs) cannot be stored to inventory
+	local isStructural = object:GetAttribute("BuildType") ~= nil
+	if storeBB then
+		storeBB.Visible = not isStructural
+	end
+
+	if moveBB then
+		moveBB.Activated:Connect(function()
+			local id = object:GetAttribute("BuildId")
+			removeBBGUI()
+			if id then 
+				startMove(object, id) 
+			else 
+				warn("Cannot run startMove: BuildId attribute is nil!") 
+			end
+		end)
+	end
+
+	if sellBB then
+		sellBB.Activated:Connect(function()
+			local id = object:GetAttribute("BuildId")
+			if id then
+				local objectName = object.Name
+				local cframe = object:GetPivot()
+
+				deleteEvent:FireServer({ObjectId = id, Reason = "delete"})
+
+				BuildHistory.pushUndo({
+					action = "Delete",
+					objectName = objectName,
+					cframe = cframe,
+					objectId = id,
+				})
+			else
+				warn("Cannot request deletion: BuildId attribute is nil!")
+			end
+			removeBBGUI()
+		end)
+	end
+
+	if storeBB then
+		storeBB.Activated:Connect(function()
+			local id = object:GetAttribute("BuildId")
+			if id then
+				storeEvent:FireServer({ObjectId = id})
+			else
+				warn("Cannot request storage: BuildId attribute is nil!")
+			end
+			removeBBGUI()
+		end)
+	end
+
+	if cancelBB then
+		cancelBB.Activated:Connect(function()
+			removeBBGUI()
+		end)
+	end
+
+	local paintBB = mainBg and mainBg:FindFirstChild("PaintBB")
+	if paintBB then
+		paintBB.Active = true
+		paintBB.Activated:Connect(function()
+			local buildId = object:GetAttribute("BuildId")
+			if buildId then
+				removeBBGUI()
+				buildGui.Enabled = false
+				player:SetAttribute("UseBuildCamera", true)
+				player:SetAttribute("PaintBuildId", buildId)
+				paintGui.Enabled = true
+			else
+				warn("Cannot open Paint UI: BuildId attribute is nil!")
+			end
+		end)
+	end
+
+	local categoryBB = mainBg and mainBg:FindFirstChild("CategoryBB")
+	if categoryBB then
+		local isRack = CollectionService:HasTag(object, "RetailRack") or CollectionService:HasTag(object, "DisplayRack")
+		categoryBB.Visible = isRack
+
+		if isRack then
+			categoryBB.Active = true
+
+			local catIcon = categoryBB:FindFirstChild("CategoryIcon")
+
+			local function refreshCategoryIcon()
+				local category = object:GetAttribute("Category") or "Category"
+				local info = CategoryIconConfig[category]
+				if info then
+					if catIcon then
+						catIcon.Image = info.icon
+					end
+					categoryBB.BackgroundColor3 = info.color
+				end
+			end
+			refreshCategoryIcon()
+			object:GetAttributeChangedSignal("Category"):Connect(refreshCategoryIcon)
+
+			categoryBB.Activated:Connect(function()
+				cycleRackCategoryRemote:FireServer(object)
+			end)
+		end
+	end
+
+	activeBBGUI = clone
+end
+
+
+function startMove(object, buildId)
+	if isMoving then return end
+	isMoving = true
+
+	local asset = findAssetByName(object.Name)
+	if not asset then
+		warn("Move Mode aborted: Could not find base asset model named", object.Name, "in ReplicatedStorage assets folders.")
+		isMoving = false
+		return
+	end
+
+	local originalCF = object:GetPivot()
+
+	local partStates = collectPartStates(object)
+	for _, state in partStates do
+		state.part.Transparency = 0.7
+		state.part.CanQuery = false
+	end
+
+	setRackVisualsHidden(object, true)
+	player:SetAttribute("IsMovingBuild", true)
+
+	moveHighlight = Instance.new("Highlight")
+	moveHighlight.Parent = workspace
+
+	PlacingService.SetPreview(asset)
+	moveTrove = Trove.new()
+
+	moveTrove:Connect(PlacingService.Rendered, function(preview, cf, canPlace)
+		moveHighlight.Adornee = preview
+		local color = canPlace and Settings.CanPlaceColor or Settings.CannotPlaceColor
+		moveHighlight.OutlineColor = color
+		moveHighlight.FillColor = color
+	end)
+
+	local function cleanupMove()
+		cancelMove = nil
+		ContextActionService:UnbindAction("PlaceObjectAction")
+		ContextActionService:UnbindAction("RotateObjectAction")
+		ContextActionService:UnbindAction("CancelPlacementAction")
+
+		if moveTrove then
+			moveTrove:Clean()
+			moveTrove = nil
+		end
+
+		PlacingService.Cancel()
+		if moveHighlight then
+			moveHighlight:Destroy()
+			moveHighlight = nil
+		end
+		restorePartStates(partStates)
+		setRackVisualsHidden(object, false)
+		player:SetAttribute("IsMovingBuild", false)
+		isMoving = false
+	end
+
+	cancelMove = cleanupMove
+
+	local function handlePlacement(actionName, inputState, inputObj)
+		if inputState ~= Enum.UserInputState.Begin then return end
+
+		if actionName == "PlaceObjectAction" then
+			local preview = PlacingService.GetPreview()
+			if not preview then return end
+
+			local cf = PlacingService._CF
+			local canPlace = PlacingService.CanPlace
+			if not cf or not canPlace then return end
+
+			moveEvent:FireServer({ObjectId = buildId, CF = cf})
+
+			BuildHistory.pushUndo({
+				action = "Move",
+				objectId = buildId,
+				oldCF = originalCF,
+				newCF = cf,
+			})
+
+			cleanupMove()
+
+		elseif actionName == "RotateObjectAction" then
+			PlacingService.Rotate(Vector3.yAxis)
+
+		elseif actionName == "CancelPlacementAction" then
+			cleanupMove()
+		end
+	end
+
+	ContextActionService:BindAction("PlaceObjectAction", handlePlacement, true, Enum.UserInputType.MouseButton1, Enum.KeyCode.ButtonA)
+	ContextActionService:BindAction("RotateObjectAction", handlePlacement, true, Settings.RotateY, Enum.KeyCode.ButtonY)
+	ContextActionService:BindAction("CancelPlacementAction", handlePlacement, true, Settings.Cancel, Enum.KeyCode.ButtonB)
+
+	ContextActionService:SetTitle("PlaceObjectAction", "Place")
+	ContextActionService:SetTitle("RotateObjectAction", "Rotate")
+	ContextActionService:SetTitle("CancelPlacementAction", "Cancel")
+end
+
+
+UserInputService.InputBegan:Connect(function(input, gameProcessed)
+	if gameProcessed then return end
+	if not buildGui.Enabled then return end
+
+	local isValidInput = (input.UserInputType == Enum.UserInputType.MouseButton1) or 
+		(input.UserInputType == Enum.UserInputType.Touch) or
+		(input.KeyCode == Enum.KeyCode.ButtonA)
+
+	if not isValidInput then return end
+	if isMoving or PlacingService.GetPreview() then return end
+	if player:GetAttribute("DeleteMode") == true then return end
+
+	if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+		local mousePos = UserInputService:GetMouseLocation()
+		local guisAtPosition = playerGui:GetGuiObjectsAtPosition(mousePos.X, mousePos.Y)
+
+		for _, guiObject in ipairs(guisAtPosition) do
+			if guiObject.Name ~= "InteractionBB" and not guiObject:IsDescendantOf(bbguiTemplate) and not guiObject:IsDescendantOf(activeBBGUI) then
+				if guiObject:IsA("GuiButton") and guiObject.Visible then
+					return 
+				end
+			end
+		end
+	end
+
+	local screenPos
+	if input.UserInputType == Enum.UserInputType.Touch or input.UserInputType == Enum.UserInputType.MouseButton1 then
+		screenPos = UserInputService:GetMouseLocation()
+	else
+		screenPos = camera.ViewportSize / 2
+	end
+
+	local ray = camera:ViewportPointToRay(screenPos.X, screenPos.Y)
+	local plot = getPlot()
+	if not plot then return end
+
+	local buildObjects = plot:FindFirstChild("BuildObjects")
+	if not buildObjects then return end
+
+	local raycastParams = RaycastParams.new()
+	raycastParams.FilterType = Enum.RaycastFilterType.Include
+	raycastParams.FilterDescendantsInstances = { buildObjects }
+
+	local result = workspace:Raycast(ray.Origin, ray.Direction * 2048, raycastParams)
+	if not result then return end
+
+	local targetObject = result.Instance
+	while targetObject and targetObject.Parent ~= buildObjects do
+		targetObject = targetObject.Parent
+	end
+
+	if not targetObject or not targetObject:GetAttribute("BuildId") then return end
+
+	if selectedObject == targetObject and activeBBGUI then 
+		return 
+	end
+
+	showBBGUI(targetObject)
+end)
+
+UserInputService.InputBegan:Connect(function(input, gameProcessed)
+	if gameProcessed then return end
+	if isMoving then return end
+	if not buildGui.Enabled then return end
+	if input.KeyCode == Settings.Cancel or input.KeyCode == Enum.KeyCode.ButtonB then
+		removeBBGUI()
+	end
+end)
+
+buildGui:GetPropertyChangedSignal("Enabled"):Connect(function()
+	if not buildGui.Enabled then
+		if cancelMove then cancelMove() end
+		removeBBGUI()
+	end
+end)
+
+player:GetAttributeChangedSignal("CancelMoveRequest"):Connect(function()
+	if player:GetAttribute("CancelMoveRequest") and isMoving then
+		if cancelMove then cancelMove() end
+	end
+end)
+
+local inventoryFrame = buildGui:WaitForChild("Inventory")
+local inventoryTemplate = inventoryFrame:WaitForChild("InventoryTemplate")
+inventoryTemplate.Parent = nil 
+
+local function setupViewport(viewportFrame, object)
+	local clone = object:Clone()
+	clone:PivotTo(CFrame.new(Vector3.zero))
+	for _, descendant in clone:GetDescendants() do
+		if descendant:IsA("BasePart") then descendant.Anchored = true end
+	end
+	clone.Parent = viewportFrame
+
+	local cam = Instance.new("Camera")
+	cam.Parent = viewportFrame
+	viewportFrame.CurrentCamera = cam
+
+	local cf, size = clone:GetBoundingBox()
+	local maxDim = math.max(size.X, size.Y, size.Z)
+	local distance = maxDim * 1.5
+	cam.CFrame = CFrame.new(cf.Position + Vector3.new(distance, distance * 0.6, distance), cf.Position)
+end
+
+local function populateInventory(inventoryData)
+	for _, child in inventoryFrame:GetChildren() do
+		if child.Name ~= "InventoryTemplate" and child:IsA("TextButton") then
+			child:Destroy()
+		end
+	end
+
+	for itemName, count in pairs(inventoryData) do
+		if count > 0 then
+			local asset = findAssetByName(itemName)
+			if asset then
+				local button = inventoryTemplate:Clone()
+				button.Name = itemName
+				button.Parent = inventoryFrame
+
+				local nameLabel = button:FindFirstChild("BuildNameLabel")
+				if nameLabel then nameLabel.Text = itemName .. " (x" .. count .. ")" end
+
+				local coinLabel = button:FindFirstChild("CoinPriceLabel")
+				if coinLabel then coinLabel.Visible = false end
+				local diamondLabel = button:FindFirstChild("DiamondPriceLabel")
+				if diamondLabel then diamondLabel.Visible = false end
+
+				local viewport = button:FindFirstChild("ViewportFrame")
+				if viewport then setupViewport(viewport, asset) end
+
+				button.MouseButton1Click:Connect(function()
+					removeBBGUI()
+					local previewTrove = Trove.new()
+					PlacingService.SetPreview(asset)
+
+					local highlight = Instance.new("Highlight")
+					highlight.Parent = workspace
+
+					previewTrove:Connect(PlacingService.Rendered, function(preview, cf, canPlace)
+						highlight.Adornee = preview
+						local color = canPlace and Settings.CanPlaceColor or Settings.CannotPlaceColor
+						highlight.OutlineColor = color
+						highlight.FillColor = color
+					end)
+
+					local function cleanupInventoryPlacement()
+						ContextActionService:UnbindAction("InventoryPlaceAction")
+						ContextActionService:UnbindAction("InventoryRotateAction")
+						ContextActionService:UnbindAction("InventoryCancelAction")
+						if previewTrove then previewTrove:Clean() end
+						PlacingService.Cancel()
+						if highlight then highlight:Destroy() end
+					end
+
+					local function handleInventoryPlacement(actionName, inputState, inputObj)
+						if inputState ~= Enum.UserInputState.Begin then return end
+
+						if actionName == "InventoryPlaceAction" then
+							local preview = PlacingService.GetPreview()
+							if not preview then return end
+
+							local cf = PlacingService._CF
+							local canPlace = PlacingService.CanPlace
+							if not cf or not canPlace then return end
+
+							placeEvent:FireServer({
+								ObjectName = itemName,
+								CF = cf,
+								FromInventory = true,
+							})
+
+							if not UserInputService:IsKeyDown(Enum.KeyCode.LeftControl) then
+								cleanupInventoryPlacement()
+							end
+
+						elseif actionName == "InventoryRotateAction" then
+							PlacingService.Rotate(Vector3.yAxis)
+
+						elseif actionName == "InventoryCancelAction" then
+							cleanupInventoryPlacement()
+						end
+					end
+
+					ContextActionService:BindAction("InventoryPlaceAction", handleInventoryPlacement, true, Enum.UserInputType.MouseButton1, Enum.KeyCode.ButtonA)
+					ContextActionService:BindAction("InventoryRotateAction", handleInventoryPlacement, true, Settings.RotateY, Enum.KeyCode.ButtonY)
+					ContextActionService:BindAction("InventoryCancelAction", handleInventoryPlacement, true, Settings.Cancel, Enum.KeyCode.ButtonB)
+
+					ContextActionService:SetTitle("InventoryPlaceAction", "Place")
+					ContextActionService:SetTitle("InventoryRotateAction", "Rotate")
+					ContextActionService:SetTitle("InventoryCancelAction", "Cancel")
+				end)
+			end
+		end
+	end
+end
+
+inventoryUpdateEvent.OnClientEvent:Connect(function(inventoryData)
+	currentInventory = inventoryData or {}
+	populateInventory(currentInventory)
+end)
+
+requestInventoryEvent:FireServer()
