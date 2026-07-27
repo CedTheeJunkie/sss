@@ -1,0 +1,43 @@
+local WallBuildConfig = {}
+
+WallBuildConfig.WallHeight = 10
+WallBuildConfig.WallThickness = 0.5
+WallBuildConfig.FloorThickness = 0.2
+WallBuildConfig.RoofThickness = 0.3
+
+WallBuildConfig.DoorWidth = 4
+WallBuildConfig.DoorHeight = 7
+WallBuildConfig.DoorThickness = 0.2
+WallBuildConfig.WindowWidth = 4
+WallBuildConfig.WindowHeight = 4
+WallBuildConfig.WindowSillHeight = 3
+WallBuildConfig.WindowThickness = 0.15
+
+-- Doors swing open (not vanish) when a PLAYER OR NPC comes within this range,
+-- and swing shut again once everyone's clear.
+WallBuildConfig.AutoOpenRange = 8
+WallBuildConfig.DoorSwingAngle = 100 -- degrees
+WallBuildConfig.DoorSwingTime = 0.5 -- seconds
+
+WallBuildConfig.TileSize = 4
+WallBuildConfig.GhostTransparency = 0.5
+
+WallBuildConfig.Colors = {
+	Wall = Color3.fromRGB(255, 255, 255),
+	Floor = Color3.fromRGB(235, 235, 238),
+	Roof = Color3.fromRGB(245, 245, 248),
+	Door = Color3.fromRGB(255, 255, 255),
+	Window = Color3.fromRGB(200, 225, 240),
+	GhostValid = Color3.fromRGB(100, 255, 100),
+	GhostInvalid = Color3.fromRGB(255, 80, 80),
+}
+
+WallBuildConfig.Materials = {
+	Wall = Enum.Material.SmoothPlastic,
+	Floor = Enum.Material.SmoothPlastic,
+	Roof = Enum.Material.SmoothPlastic,
+	Door = Enum.Material.SmoothPlastic,
+	Window = Enum.Material.Glass,
+}
+
+return WallBuildConfig
